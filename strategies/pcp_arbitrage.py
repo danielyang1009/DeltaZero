@@ -38,52 +38,74 @@ class TickAligner:
     多合约 Tick 流时间对齐器
 
     维护每个合约的最新报价快照（Last-Known-Value 机制）。
-    当任一合约更新时，可查询所有合约的最新状态。
+    支持多标的 ETF：按 etf_code 分别存储，避免多品种互相覆盖。
 
     Attributes:
         latest_option_quotes: 合约代码 -> 最新 TickData
-        latest_etf_quote: 最新 ETF 价格
+        latest_etf_quotes: ETF代码 -> 最新 ETFTickData（多品种支持）
+        latest_etf_quote: 最近更新的 ETF 行情（向后兼容）
     """
 
     def __init__(self) -> None:
         self.latest_option_quotes: Dict[str, TickData] = {}
-        self.latest_etf_quote: Optional[ETFTickData] = None
+        self.latest_etf_quotes: Dict[str, ETFTickData] = {}   # 按标的代码分别存储
+        self.latest_etf_quote: Optional[ETFTickData] = None   # 向后兼容：最近更新的 ETF
 
     def update_option(self, tick: TickData) -> None:
         """更新期权报价快照"""
         self.latest_option_quotes[tick.contract_code] = tick
 
     def update_etf(self, tick: ETFTickData) -> None:
-        """更新 ETF 报价快照"""
-        self.latest_etf_quote = tick
+        """更新 ETF 报价快照（按 etf_code 分别存储）"""
+        self.latest_etf_quotes[tick.etf_code] = tick
+        self.latest_etf_quote = tick  # 向后兼容
 
     def get_option_quote(self, code: str) -> Optional[TickData]:
         """获取指定合约的最新报价"""
         return self.latest_option_quotes.get(code)
 
-    def get_etf_price(self) -> Optional[float]:
-        """获取最新 ETF 价格"""
-        if self.latest_etf_quote is None:
-            return None
-        return self.latest_etf_quote.price
+    def get_etf_price(self, underlying_code: Optional[str] = None) -> Optional[float]:
+        """
+        获取 ETF 最新价格
 
-    def get_etf_ask(self) -> Optional[float]:
+        Args:
+            underlying_code: ETF 代码（如 '510050.SH'）。不传则返回最近更新的 ETF 价格。
+        """
+        quote = (
+            self.latest_etf_quotes.get(underlying_code)
+            if underlying_code
+            else self.latest_etf_quote
+        )
+        return quote.price if quote is not None else None
+
+    def get_etf_ask(self, underlying_code: Optional[str] = None) -> Optional[float]:
         """获取 ETF 卖一价"""
-        if self.latest_etf_quote is None:
+        quote = (
+            self.latest_etf_quotes.get(underlying_code)
+            if underlying_code
+            else self.latest_etf_quote
+        )
+        if quote is None:
             return None
-        price = self.latest_etf_quote.ask_price
-        return price if not math.isnan(price) else self.latest_etf_quote.price
+        price = quote.ask_price
+        return price if not math.isnan(price) else quote.price
 
-    def get_etf_bid(self) -> Optional[float]:
+    def get_etf_bid(self, underlying_code: Optional[str] = None) -> Optional[float]:
         """获取 ETF 买一价"""
-        if self.latest_etf_quote is None:
+        quote = (
+            self.latest_etf_quotes.get(underlying_code)
+            if underlying_code
+            else self.latest_etf_quote
+        )
+        if quote is None:
             return None
-        price = self.latest_etf_quote.bid_price
-        return price if not math.isnan(price) else self.latest_etf_quote.price
+        price = quote.bid_price
+        return price if not math.isnan(price) else quote.price
 
     def reset(self) -> None:
         """清空所有快照"""
         self.latest_option_quotes.clear()
+        self.latest_etf_quotes.clear()
         self.latest_etf_quote = None
 
 
@@ -163,7 +185,10 @@ class PCPArbitrage:
         """
         call_tick = self.aligner.get_option_quote(call_info.contract_code)
         put_tick = self.aligner.get_option_quote(put_info.contract_code)
-        etf_price = self.aligner.get_etf_price()
+
+        # 按合约标的代码查询对应 ETF 行情（多品种支持）
+        underlying = call_info.underlying_code
+        etf_price = self.aligner.get_etf_price(underlying)
 
         if call_tick is None or put_tick is None or etf_price is None:
             return None
@@ -189,8 +214,8 @@ class PCPArbitrage:
 
         theoretical_spread = etf_price - pv_strike  # S - K*exp(-rT)
 
-        etf_ask = self.aligner.get_etf_ask() or etf_price
-        etf_bid = self.aligner.get_etf_bid() or etf_price
+        etf_ask = self.aligner.get_etf_ask(underlying) or etf_price
+        etf_bid = self.aligner.get_etf_bid(underlying) or etf_price
 
         # === 正向套利（Conversion）===
         # 卖出 Call（得 C_bid）+ 买入 Put（付 P_ask）+ 买入现货（付 S_ask）
