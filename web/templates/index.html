@@ -47,17 +47,21 @@ pre{background:#0f172a;color:#e2e8f0;padding:10px;border-radius:8px;max-height:1
 <h1>DeltaZero 控制台</h1>
 
 <div class="card" style="margin-bottom:12px">
-  <div class="kv"><span class="k">时间</span><span class="v" id="sTime">--</span></div>
-  <div class="kv"><span class="k">快照</span><span class="v" id="sSnap">--</span></div>
-  <div class="kv"><span class="k">今日分片</span><span class="v" id="sChunks">--</span></div>
+  <div class="kv"><span class="k">服务器时间</span><span class="v" id="sTime">--</span></div>
 </div>
 
 <div class="row">
   <div class="card">
-    <div class="card-title">盘前盘后任务</div>
-    <div style="display:flex;gap:10px;margin-bottom:6px">
+    <div class="card-title">DDE</div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+      <button class="btn-primary" onclick="window.open('/dde','_blank')">打开 DDE 抓取面板</button>
+    </div>
+    <div id="metadataFiles" style="margin-top:8px;font-size:12px;color:#64748b"></div>
+  </div>
+  <div class="card">
+    <div class="card-title">Wind</div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap">
       <button class="btn-secondary" id="btnFetch" onclick="runFetch()">抓取今日期权链</button>
-      <button class="btn-secondary" id="btnMerge" onclick="runMerge()">合并今日分片</button>
     </div>
     <div id="fetchProgress" style="display:none">
       <div class="progress-wrap">
@@ -67,13 +71,28 @@ pre{background:#0f172a;color:#e2e8f0;padding:10px;border-radius:8px;max-height:1
       <div class="kv" id="fetchStep" style="color:#64748b"></div>
     </div>
     <pre id="fetchLog" style="display:none"></pre>
-    <pre id="mergeLog" style="display:none"></pre>
   </div>
   <div class="card">
-    <div class="card-title">Recorder — 数据记录 <span id="recBadge"></span></div>
+    <div class="card-title">DataBus <span id="recBadge"></span></div>
     <div id="recStatus">加载中...</div>
+    <div style="margin-top:8px">
+      <button class="btn-secondary btn-sm" id="btnMerge" onclick="runMerge()">合并今日分片</button>
+    </div>
+    <pre id="mergeLog" style="display:none;margin-top:8px"></pre>
     <hr class="sep"/>
     <div id="recActions"></div>
+  </div>
+</div>
+
+<div class="card" style="margin-bottom:12px">
+  <div class="card-title">Monitor — 正向套利监控</div>
+  <div style="display:flex;flex-wrap:wrap;gap:10px 18px;align-items:center">
+    <span class="kv" style="margin:0"><label style="min-width:auto;margin-right:4px">利润≥</label><input id="monProfit" value="30" type="number" step="1" style="width:60px"/>元</span>
+    <span class="kv" style="margin:0"><label style="min-width:auto;margin-right:4px">到期≤</label><input id="monExpiry" value="90" type="number" style="width:55px"/>天</span>
+    <span class="kv" style="margin:0"><label style="min-width:auto;margin-right:4px">刷新</label><input id="monRefresh" value="3" type="number" style="width:45px"/>秒</span>
+    <span class="kv" style="margin:0"><label style="min-width:auto;margin-right:4px">ATM</label><input id="monAtm" value="0.20" type="number" step="0.01" style="width:55px"/></span>
+    <span class="kv" style="margin:0"><label style="min-width:auto;margin-right:4px">ZMQ端口</label><input id="monZmq" value="5555" type="number" style="width:60px"/></span>
+    <button class="btn-primary" onclick="startMonitor()">启动 Monitor</button>
   </div>
 </div>
 
@@ -88,19 +107,6 @@ pre{background:#0f172a;color:#e2e8f0;padding:10px;border-radius:8px;max-height:1
     <thead><tr><th>类型</th><th>PID</th><th>参数</th><th>运行时长</th><th>操作</th></tr></thead>
     <tbody id="procBody"><tr><td colspan="5" style="color:#94a3b8">加载中...</td></tr></tbody>
   </table>
-</div>
-
-<div class="card">
-  <div class="card-title">Monitor — 正向套利监控</div>
-  <div style="display:flex;flex-wrap:wrap;gap:10px 18px;align-items:center">
-    <span class="kv" style="margin:0"><label style="min-width:auto;margin-right:4px">来源</label><select id="monSource" onchange="toggleZmq()" title="Wind 仅支持单实例"><option value="wind">wind</option><option value="zmq" selected>zmq</option></select></span>
-    <span class="kv" style="margin:0"><label style="min-width:auto;margin-right:4px">利润≥</label><input id="monProfit" value="30" type="number" step="1" style="width:60px"/>元</span>
-    <span class="kv" style="margin:0"><label style="min-width:auto;margin-right:4px">到期≤</label><input id="monExpiry" value="90" type="number" style="width:55px"/>天</span>
-    <span class="kv" style="margin:0"><label style="min-width:auto;margin-right:4px">刷新</label><input id="monRefresh" value="3" type="number" style="width:45px"/>秒</span>
-    <span class="kv" style="margin:0"><label style="min-width:auto;margin-right:4px">ATM</label><input id="monAtm" value="0.20" type="number" step="0.01" style="width:55px"/></span>
-    <span id="zmqFields" style="display:none"><label style="min-width:auto;margin-right:4px">ZMQ端口</label><input id="monZmq" value="5555" type="number" style="width:60px"/></span>
-    <button class="btn-primary" onclick="startMonitor()">启动 Monitor</button>
-  </div>
 </div>
 
 <div class="toast" id="toast"></div>
@@ -129,23 +135,24 @@ async function api(url, method="GET", body=null){
   return data;
 }
 
-function renderSnapshot(s){
-  if(!s || s.status==="not_found") return "快照文件不存在（recorder 尚未写入）";
-  if(s.status==="error") return s.text;
-  let t = s.coverage;
-  t += ` | 期权 ${s.n_options} 合约`;
-  if(s.adj_count) t += `（调整型 ${s.adj_count}）`;
-  t += ` | ETF ${s.n_etf} 条`;
-  if(s.mtime) t += ` | 更新 ${s.mtime}（${s.mtime_age}）`;
-  return t;
-}
-
-function renderChunks(c){
-  if(!c) return "--";
-  if(c.n_opt === 0 && c.n_etf === 0) return "暂无";
-  let t = `期权 ${c.n_opt} 个  ETF ${c.n_etf} 个  共 ${c.total_mb} MB`;
-  if(c.latest_time) t += `  最新 ${c.latest_time}`;
-  return t;
+function renderMetadataFiles(mf){
+  const el = $("metadataFiles");
+  if(!mf){
+    el.innerHTML = "";
+    return;
+  }
+  const oc = mf.wind_50etf_optionchain;
+  const wxy = mf.wxy_50etf;
+  const parts = [];
+  if(oc){
+    const s = oc.mtime_ago === "文件不存在" ? "badge-down" : "badge-ok";
+    parts.push(`wind_50etf_optionchain.xlsx <span class="badge ${s}">${oc.mtime_ago}</span>`);
+  }
+  if(wxy){
+    const s = wxy.mtime_ago === "文件不存在" ? "badge-down" : "badge-ok";
+    parts.push(`wxy_50etf.xlsx <span class="badge ${s}">${wxy.mtime_ago}</span>`);
+  }
+  el.innerHTML = parts.length ? parts.join(" &nbsp; ") : "";
 }
 
 function renderRecorder(st){
@@ -153,12 +160,15 @@ function renderRecorder(st){
   const act = $("recActions");
   const badge = $("recBadge");
   if(st.recorder_running){
-    const rec = st.processes.find(p => p.kind === "recorder");
+    const rec = st.processes.find(p => p.kind === "databus");
     badge.className = "badge badge-ok";
     badge.innerText = "运行中";
     let html = `<div class="kv"><span class="k">状态</span><span class="v" style="color:#16a34a;font-weight:700">● 运行中  PID ${rec.pid}  已运行 ${rec.uptime}</span></div>`;
+    if(rec && rec.params){
+      html += `<div class="kv"><span class="k">采集参数</span><span class="v">${rec.params}</span></div>`;
+    }
     if(st.recorder_count > 1){
-      html += `<div class="kv" style="color:#d97706;font-weight:600">⚠ 检测到 ${st.recorder_count} 个 Recorder 实例！</div>`;
+      html += `<div class="kv" style="color:#d97706;font-weight:600">⚠ 检测到 ${st.recorder_count} 个 DataBus 实例！</div>`;
     }
     const s = st.snapshot;
     if(s && s.status === "ok"){
@@ -168,6 +178,20 @@ function renderRecorder(st){
       html += `<div class="kv"><span class="k">期权快照</span><span class="v">${optLine}</span></div>`;
       html += `<div class="kv"><span class="k">ETF 快照</span><span class="v">${s.n_etf} 条</span></div>`;
       if(s.mtime) html += `<div class="kv"><span class="k">快照更新</span><span class="v">${s.mtime}（${s.mtime_age}）</span></div>`;
+    }
+    const m = st.merge_status;
+    if(m){
+      const now = new Date();
+      const afterMergeTime = (now.getHours() > 15) || (now.getHours() === 15 && now.getMinutes() >= 10);
+      if(m.merged_full){
+        html += `<div class="kv"><span class="k">日终合并</span><span class="v" style="color:#16a34a;font-weight:600">已自动合并 ${m.date}${m.mtime ? `（${m.mtime}，${m.mtime_age}）` : ""}</span></div>`;
+      } else if(m.merged_any){
+        html += `<div class="kv"><span class="k">日终合并</span><span class="v" style="color:#d97706;font-weight:600">部分完成 ${m.date}（options=${m.options_exists ? "✓" : "×"} / etf=${m.etf_exists ? "✓" : "×"}）</span></div>`;
+      } else {
+        const color = afterMergeTime ? "#dc2626" : "#64748b";
+        const text = afterMergeTime ? "未合并（已过 15:10）" : "未合并（15:10 后自动触发）";
+        html += `<div class="kv"><span class="k">日终合并</span><span class="v" style="color:${color};font-weight:600">${text}</span></div>`;
+      }
     }
     const c = st.chunks;
     if(c && (c.n_opt > 0 || c.n_etf > 0)){
@@ -180,8 +204,34 @@ function renderRecorder(st){
   } else {
     badge.className = "badge badge-down";
     badge.innerText = "未运行";
-    el.innerHTML = `<div class="kv"><span class="k">状态</span><span class="v" style="color:#dc2626;font-weight:700">● 未运行</span></div>`;
-    act.innerHTML = `<button class="btn-primary btn-sm" onclick="startRecorder()">启动 Recorder</button>`;
+    let html = `<div class="kv"><span class="k">状态</span><span class="v" style="color:#dc2626;font-weight:700">● 未运行</span></div>`;
+    const m = st.merge_status;
+    if(m){
+      const now = new Date();
+      const afterMergeTime = (now.getHours() > 15) || (now.getHours() === 15 && now.getMinutes() >= 10);
+      if(m.merged_full){
+        html += `<div class="kv"><span class="k">日终合并</span><span class="v" style="color:#16a34a;font-weight:600">已自动合并 ${m.date}${m.mtime ? `（${m.mtime}，${m.mtime_age}）` : ""}</span></div>`;
+      } else if(m.merged_any){
+        html += `<div class="kv"><span class="k">日终合并</span><span class="v" style="color:#d97706;font-weight:600">部分完成 ${m.date}（options=${m.options_exists ? "✓" : "×"} / etf=${m.etf_exists ? "✓" : "×"}）</span></div>`;
+      } else {
+        const color = afterMergeTime ? "#dc2626" : "#64748b";
+        const text = afterMergeTime ? "未合并（已过 15:10）" : "未合并（15:10 后自动触发）";
+        html += `<div class="kv"><span class="k">日终合并</span><span class="v" style="color:${color};font-weight:600">${text}</span></div>`;
+      }
+    }
+    const c = st.chunks;
+    if(c && (c.n_opt > 0 || c.n_etf > 0)){
+      let chk = `期权 ${c.n_opt} 个  ETF ${c.n_etf} 个  共 ${c.total_mb} MB`;
+      if(c.latest_time) chk += `  最新 ${c.latest_time}`;
+      html += `<div class="kv"><span class="k">今日分片</span><span class="v">${chk}</span></div>`;
+    } else if(c){
+      html += `<div class="kv"><span class="k">今日分片</span><span class="v" style="color:#94a3b8">暂无</span></div>`;
+    }
+    el.innerHTML = html;
+    act.innerHTML = `
+      <button class="btn-primary btn-sm" onclick="startRecorder('dde')">启动 DDE DataBus</button>
+      <button class="btn-open btn-sm" onclick="startRecorder('wind')">启动 Wind DataBus</button>
+    `;
   }
 }
 
@@ -196,8 +246,8 @@ function renderProcessTable(procs){
   }
   $("procCount").className = "badge badge-ok";
   $("procCount").style.cssText = "";
-  const kindLabel = {recorder:"Recorder", monitor:"Monitor"};
-  const kindColor = {recorder:"#2563eb", monitor:"#16a34a"};
+  const kindLabel = {databus:"DataBus", monitor:"Monitor"};
+  const kindColor = {databus:"#2563eb", monitor:"#16a34a"};
   body.innerHTML = procs.map(p =>
     `<tr>
       <td><span style="color:${kindColor[p.kind]||'#333'};font-weight:600">${kindLabel[p.kind]||p.kind}</span></td>
@@ -217,8 +267,7 @@ async function refresh(){
     const st = await api("/api/state");
     marketDataDir = st.market_data_dir || marketDataDir;
     $("sTime").innerText = st.server_time;
-    $("sSnap").innerText = renderSnapshot(st.snapshot);
-    $("sChunks").innerText = renderChunks(st.chunks);
+    renderMetadataFiles(st.metadata_files);
     renderRecorder(st);
     renderProcessTable(st.processes);
   } catch(e){ console.error(e); }
@@ -241,7 +290,7 @@ async function reopenPid(pid){
 }
 
 async function killAll(){
-  if(!confirm("确认关闭所有 Recorder 和 Monitor 进程？")) return;
+  if(!confirm("确认关闭所有 DataBus 和 Monitor 进程？")) return;
   try{
     const r = await api("/api/processes/kill-all","POST");
     toast(`已关闭 ${r.killed.length} 个进程`);
@@ -249,21 +298,16 @@ async function killAll(){
   await refresh();
 }
 
-async function startRecorder(){
+async function startRecorder(source="wind"){
   try{
-    const r = await api("/api/processes/recorder/start","POST");
-    toast("Recorder 已启动 PID "+r.started.pid);
+    const r = await api("/api/processes/recorder/start","POST", { source });
+    toast(`${source.toUpperCase()} DataBus 已启动 PID `+r.started.pid);
   } catch(e){ toast(e.message, false); }
   setTimeout(refresh, 1500);
 }
 
-function toggleZmq(){
-  $("zmqFields").style.display = $("monSource").value==="zmq" ? "block" : "none";
-}
-
 async function startMonitor(){
   const body = {
-    source: $("monSource").value,
     min_profit: parseFloat($("monProfit").value),
     expiry_days: parseInt($("monExpiry").value),
     refresh: parseInt($("monRefresh").value),
@@ -342,7 +386,6 @@ async function runMerge(){
   await refresh();
 }
 
-toggleZmq();
 refresh();
 pollTimer = setInterval(refresh, POLL_MS);
 </script>

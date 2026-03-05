@@ -3,8 +3,8 @@
 开盘前从 Wind 抓取期权链（含合约乘数），保存到 metadata 目录。
 
 用法:
-    python -m data_engine.fetch_optionchain [--date YYYY-MM-DD]
-    python -m data_engine.fetch_optionchain --timeout 90 --retry 2
+    python -m data_engine.optionchain_fetcher [--date YYYY-MM-DD]
+    python -m data_engine.optionchain_fetcher --timeout 90 --retry 2
 
 输出: metadata/YYYY-MM-DD_optionchain.csv
 """

@@ -1,0 +1,186 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>DDE 抓取结果</title>
+<style>
+*{box-sizing:border-box}
+body{font-family:"Segoe UI",Arial,sans-serif;margin:0;padding:16px 20px;background:#f5f7fb;color:#1e293b}
+h1{margin:0 0 12px;font-size:22px}
+.card{background:#fff;border:1px solid #dde1ea;border-radius:10px;padding:14px 16px;margin-bottom:12px}
+.row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+.kv{font-size:13px;color:#475569}
+button{padding:6px 14px;border:none;border-radius:6px;font-size:13px;cursor:pointer;font-weight:600}
+button:disabled{opacity:.5;cursor:not-allowed}
+.btn-primary{background:#2563eb;color:#fff}
+.btn-danger{background:#dc2626;color:#fff}
+.btn-secondary{background:#64748b;color:#fff}
+table{width:100%;border-collapse:collapse;font-size:12px}
+th{text-align:left;padding:6px 8px;background:#f8fafc;color:#64748b;border-bottom:2px solid #e2e8f0}
+td{padding:5px 8px;border-bottom:1px solid #eef2f7}
+.mono{font-family:Consolas,Monaco,monospace}
+.good{color:#16a34a;font-weight:700}
+.bad{color:#dc2626;font-weight:700}
+.toast{position:fixed;top:16px;right:16px;padding:10px 18px;border-radius:8px;color:#fff;font-size:13px;z-index:999;opacity:0;transition:opacity .3s}
+.toast.show{opacity:1}
+.toast-ok{background:#16a34a}
+.toast-err{background:#dc2626}
+</style>
+</head>
+<body>
+<h1>DDE 抓取结果面板</h1>
+
+<div class="card">
+  <div class="row">
+    <button class="btn-primary" id="btnStart" onclick="startDDE()">启动 DDE</button>
+    <button class="btn-danger" id="btnStop" onclick="stopDDE()">停止 DDE</button>
+    <button class="btn-secondary" onclick="pollNow()">立即刷新</button>
+    <label class="kv">自动刷新 <input type="checkbox" id="autoPoll" checked onchange="toggleAuto()"/></label>
+    <label class="kv">间隔(s) <input type="number" id="interval" value="3" min="1" step="1" style="width:60px"/></label>
+    <span class="kv">状态：<span id="running" class="bad">未启动</span></span>
+  </div>
+  <div class="row" style="margin-top:8px">
+    <span class="kv">最后更新时间：<span id="ts">--</span></span>
+    <span class="kv">路由数：<span id="routeCount">0</span></span>
+    <span class="kv">有效最新价：<span id="validCount">0</span></span>
+    <span class="kv">数据模式：<span id="dataMode" style="color:#7c3aed">--</span></span>
+    <span class="kv">合约信息更新于：<span id="ocMtime" style="color:#2563eb">--</span></span>
+  </div>
+</div>
+
+<div class="card">
+  <table>
+    <thead>
+      <tr>
+        <th>代码</th>
+        <th>标的</th>
+        <th>类型</th>
+        <th>行权价</th>
+        <th>到期日</th>
+        <th>LAST</th>
+        <th>BID1</th>
+        <th>ASK1</th>
+        <th>B1V</th>
+        <th>A1V</th>
+      </tr>
+    </thead>
+    <tbody id="tbody"><tr><td colspan="10" style="color:#94a3b8">等待启动 DDE...</td></tr></tbody>
+  </table>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+let timer = null;
+
+function $(id){ return document.getElementById(id); }
+function fmt(v){ return (v===null || v===undefined) ? "--" : v; }
+function fmtNum(v, d=4){ return (typeof v === "number") ? v.toFixed(d) : "--"; }
+function toast(msg, ok=true){
+  const el = $("toast");
+  el.className = "toast show " + (ok ? "toast-ok" : "toast-err");
+  el.innerText = msg;
+  setTimeout(()=> el.className = "toast", 2200);
+}
+
+async function api(url, method="GET", body=null){
+  const opts = { method, headers: {"Content-Type":"application/json"} };
+  if(body) opts.body = JSON.stringify(body);
+  const resp = await fetch(url, opts);
+  const data = await resp.json();
+  if(!resp.ok) throw new Error(data.detail || JSON.stringify(data));
+  return data;
+}
+
+function setRunning(running){
+  $("running").innerText = running ? "运行中" : "未启动";
+  $("running").className = running ? "good" : "bad";
+  $("btnStart").disabled = running;
+  $("btnStop").disabled = !running;
+}
+
+async function refreshState(){
+  try{
+    const st = await api("/api/dde/state");
+    setRunning(st.running);
+    $("routeCount").innerText = st.route_count || 0;
+    $("ocMtime").innerText = st.optionchain_mtime || "未找到";
+    const modeText = st.data_mode === "databus"
+      ? `databus(${st.recorder_source || "unknown"})`
+      : "direct_dde";
+    $("dataMode").innerText = modeText;
+  }catch(e){
+    toast(e.message, false);
+  }
+}
+
+async function startDDE(){
+  const interval = parseFloat($("interval").value || "3");
+  try{
+    const r = await api("/api/dde/start", "POST", { interval });
+    $("routeCount").innerText = r.route_count || 0;
+    setRunning(true);
+    toast(`DDE 启动成功，路由 ${r.route_count} 条`);
+    await pollNow();
+  }catch(e){
+    toast(e.message, false);
+  }
+}
+
+async function stopDDE(){
+  try{
+    await api("/api/dde/stop", "POST");
+    setRunning(false);
+    toast("DDE 已停止");
+  }catch(e){
+    toast(e.message, false);
+  }
+}
+
+async function pollNow(){
+  try{
+    const r = await api("/api/dde/poll");
+    $("ts").innerText = r.time || "--";
+    $("routeCount").innerText = r.route_count || 0;
+    $("validCount").innerText = r.valid_last_count || 0;
+    const rows = r.rows || [];
+    if(rows.length === 0){
+      $("tbody").innerHTML = `<tr><td colspan="10" style="color:#94a3b8">没有返回数据</td></tr>`;
+      return;
+    }
+    $("tbody").innerHTML = rows.map(x => `
+      <tr>
+        <td class="mono">${fmt(x.code)}</td>
+        <td>${fmt(x.underlying)}</td>
+        <td>${fmt(x.type)}</td>
+        <td>${fmt(x.strike)}</td>
+        <td>${fmt(x.expiry)}</td>
+        <td>${fmtNum(x.last,4)}</td>
+        <td>${fmtNum(x.bid1,4)}</td>
+        <td>${fmtNum(x.ask1,4)}</td>
+        <td>${fmtNum(x.bidv1,0)}</td>
+        <td>${fmtNum(x.askv1,0)}</td>
+      </tr>
+    `).join("");
+  }catch(e){
+    $("tbody").innerHTML = `<tr><td colspan="10" style="color:#94a3b8">${e.message}</td></tr>`;
+  }
+}
+
+function toggleAuto(){
+  if(timer){
+    clearInterval(timer);
+    timer = null;
+  }
+  if($("autoPoll").checked){
+    const iv = Math.max(1, parseInt($("interval").value || "3", 10));
+    timer = setInterval(pollNow, iv * 1000);
+  }
+}
+
+refreshState();
+toggleAuto();
+</script>
+</body>
+</html>

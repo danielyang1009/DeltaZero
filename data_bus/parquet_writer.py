@@ -48,6 +48,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
+from utils.time_utils import bj_now_naive, bj_today
 
 # ──────────────────────────────────────────────────────────────────────
 # PyArrow Schema 定义（延迟导入，不强制依赖）
@@ -127,7 +128,7 @@ class ParquetWriter:
         self._snapshot:    Dict[str, Dict[str, Any]] = {}
 
         self._lock = threading.Lock()
-        self._last_flush_time = datetime.now()
+        self._last_flush_time = bj_now_naive()
 
         logger.info("ParquetWriter 初始化：%s  刷新间隔 %ds", self._root, flush_interval_secs)
 
@@ -173,7 +174,7 @@ class ParquetWriter:
 
     def should_flush(self) -> bool:
         """是否到了刷新时间"""
-        elapsed = (datetime.now() - self._last_flush_time).total_seconds()
+        elapsed = (bj_now_naive() - self._last_flush_time).total_seconds()
         return elapsed >= self._flush_interval
 
     def flush(self, dt: Optional[datetime] = None) -> int:
@@ -184,7 +185,7 @@ class ParquetWriter:
             本次写入的总 tick 行数
         """
         if dt is None:
-            dt = datetime.now()
+            dt = bj_now_naive()
 
         with self._lock:
             opt_rows  = self._opt_buffer[:]
@@ -233,7 +234,7 @@ class ParquetWriter:
         Wind 在盘前/盘后仍会推送数据，合并时过滤掉这些无效 tick。
         """
         if target_date is None:
-            target_date = date.today()
+            target_date = bj_today()
         date_str = target_date.strftime("%Y%m%d")
 
         for prefix, schema, row_func in [
@@ -260,8 +261,8 @@ class ParquetWriter:
                 # 过滤：仅保留交易时间 9:30-11:30、13:00-15:00
                 if original_count > 0 and "ts" in merged.column_names:
                     df = merged.to_pandas()
-                    df["_dt"] = pd.to_datetime(df["ts"], unit="ms")
-                    df["_dt"] = df["_dt"].dt.tz_localize(None)
+                    df["_dt"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
+                    df["_dt"] = df["_dt"].dt.tz_convert("Asia/Shanghai").dt.tz_localize(None)
                     df["_h"] = df["_dt"].dt.hour
                     df["_m"] = df["_dt"].dt.minute
                     df["_date_ok"] = df["_dt"].dt.date == target_date

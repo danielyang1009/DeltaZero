@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from config.settings import ETF_CODE_TO_NAME
+from utils.time_utils import bj_from_timestamp, bj_now_naive, bj_today
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
@@ -46,7 +47,7 @@ def run_fetch_bg(date_str: str, timeout: int = 90, retry: int = 1) -> None:
     cmd = [
         sys.executable,
         "-m",
-        "data_engine.fetch_optionchain",
+        "data_engine.optionchain_fetcher",
         "--date",
         date_str,
         "--timeout",
@@ -105,7 +106,7 @@ def read_snapshot_stats(market_data_dir: str) -> Optional[Dict]:
                 if cnt > 0:
                     underlying_counts[name] = cnt
         adj_count = int(df["is_adjusted"].sum()) if "is_adjusted" in df.columns else 0
-        mtime = datetime.fromtimestamp(snap_path.stat().st_mtime)
+        mtime = bj_from_timestamp(snap_path.stat().st_mtime).replace(tzinfo=None)
         return {
             "n_options": len(opts),
             "n_etf": len(etfs),
@@ -119,7 +120,7 @@ def read_snapshot_stats(market_data_dir: str) -> Optional[Dict]:
 
 def count_today_chunks(market_data_dir: str) -> Dict:
     chunks_dir = Path(market_data_dir) / "chunks"
-    today_str = date.today().strftime("%Y%m%d")
+    today_str = bj_today().strftime("%Y%m%d")
     if not chunks_dir.exists():
         return {"n_opt": 0, "n_etf": 0, "total_mb": 0.0, "latest_time": None}
     opt_chunks = sorted(chunks_dir.glob(f"options_{today_str}_*.parquet"))
@@ -128,7 +129,7 @@ def count_today_chunks(market_data_dir: str) -> Dict:
     total_bytes = sum(c.stat().st_size for c in all_chunks if c.exists())
     latest_time: Optional[datetime] = None
     if all_chunks:
-        latest_time = datetime.fromtimestamp(max(c.stat().st_mtime for c in all_chunks if c.exists()))
+        latest_time = bj_from_timestamp(max(c.stat().st_mtime for c in all_chunks if c.exists())).replace(tzinfo=None)
     return {
         "n_opt": len(opt_chunks),
         "n_etf": len(etf_chunks),
@@ -145,7 +146,7 @@ def run_merge(target_date: date, market_data_dir: str) -> Dict[str, Any]:
     if not opt_chunks and not etf_chunks:
         return {"ok": True, "output": f"未找到 {target_date} 的分片文件，无需合并"}
     try:
-        from data_recorder.parquet_writer import ParquetWriter
+        from data_bus.parquet_writer import ParquetWriter
 
         writer = ParquetWriter(market_data_dir)
         writer.merge_daily(target_date)
@@ -168,7 +169,7 @@ def fmt_time_short(dt: Optional[datetime]) -> Optional[str]:
 
 
 def age_str(dt: datetime) -> str:
-    sec = int((datetime.now() - dt).total_seconds())
+    sec = int((bj_now_naive() - dt).total_seconds())
     if sec < 60:
         return f"{sec}s前"
     if sec < 3600:
@@ -178,7 +179,7 @@ def age_str(dt: datetime) -> str:
 
 def snapshot_readable(raw: Optional[Dict]) -> Dict[str, Any]:
     if raw is None:
-        return {"status": "not_found", "text": "快照文件不存在（recorder 尚未写入）"}
+        return {"status": "not_found", "text": "快照文件不存在（DataBus 尚未写入）"}
     if "error" in raw:
         return {"status": "error", "text": raw["error"]}
     uc = raw.get("underlying_counts", {})
@@ -203,5 +204,42 @@ def chunks_readable(raw: Dict) -> Dict[str, Any]:
         "n_etf": raw.get("n_etf", 0),
         "total_mb": round(raw.get("total_mb", 0), 2),
         "latest_time": fmt_time_short(lt) if isinstance(lt, datetime) else lt,
+    }
+
+
+def merge_status_readable(market_data_dir: str, target_date: Optional[date] = None) -> Dict[str, Any]:
+    """
+    返回今日（日）合并状态。
+    判定依据：是否生成 options_YYYYMMDD.parquet / etf_YYYYMMDD.parquet。
+    """
+    d = target_date or bj_today()
+    d_str = d.strftime("%Y%m%d")
+    root = Path(market_data_dir)
+    opt = root / f"options_{d_str}.parquet"
+    etf = root / f"etf_{d_str}.parquet"
+
+    opt_ok = opt.exists()
+    etf_ok = etf.exists()
+    merged_any = opt_ok or etf_ok
+    merged_full = opt_ok and etf_ok
+
+    latest_mtime: Optional[datetime] = None
+    if merged_any:
+        mtimes = []
+        if opt_ok:
+            mtimes.append(opt.stat().st_mtime)
+        if etf_ok:
+            mtimes.append(etf.stat().st_mtime)
+        if mtimes:
+            latest_mtime = bj_from_timestamp(max(mtimes)).replace(tzinfo=None)
+
+    return {
+        "date": d_str,
+        "merged_any": merged_any,
+        "merged_full": merged_full,
+        "options_exists": opt_ok,
+        "etf_exists": etf_ok,
+        "mtime": fmt_time_short(latest_mtime) if latest_mtime else None,
+        "mtime_age": age_str(latest_mtime) if latest_mtime else None,
     }
 

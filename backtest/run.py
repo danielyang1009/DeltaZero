@@ -35,10 +35,10 @@ def run_backtest(
 ) -> None:
     from analysis.pnl import PnLAnalyzer
     from backtest.engine import BacktestEngine, MergedTick
-    from data_engine.bar_loader import BarDataLoader
-    from data_engine.contract_info import ContractInfoManager, get_optionchain_path
-    from data_engine.etf_simulator import ETFSimulator
-    from data_engine.tick_loader import TickLoader
+    from data_engine.bar_data_loader import BarDataLoader
+    from data_engine.contract_catalog import ContractInfoManager, get_optionchain_path
+    from backtest.etf_price_simulator import ETFSimulator
+    from data_engine.tick_data_loader import TickLoader
     from strategies.pcp_arbitrage import PCPArbitrage
 
     logger.info("=" * 60)

@@ -22,8 +22,9 @@ from datetime import date, datetime
 from queue import Queue
 from typing import Callable, Dict, List, Optional, Tuple
 
-from models import ETFTickData, TickData, normalize_code
-from data_engine.contract_info import ContractInfoManager, get_optionchain_path
+from models import DataProvider, ETFTickData, TickData, TickPacket, normalize_code
+from data_engine.contract_catalog import ContractInfoManager, get_optionchain_path
+from utils.time_utils import bj_now_naive, bj_today
 from utils.wind_helpers import (
     wind_connect,
     wind_row_to_etf_tick,
@@ -68,19 +69,7 @@ def _parse_indata_row(indata, j: int) -> dict:
 # WindSubscriber
 # ──────────────────────────────────────────────────────────────────────
 
-class TickPacket:
-    """从 Wind 回调线程传递到主线程的 tick 数据包"""
-    __slots__ = ("is_etf", "tick_row", "tick_obj", "underlying_code")
-
-    def __init__(self, is_etf: bool, tick_row: dict,
-                 tick_obj, underlying_code: str) -> None:
-        self.is_etf         = is_etf
-        self.tick_row       = tick_row        # 供 ParquetWriter 使用
-        self.tick_obj       = tick_obj        # TickData 或 ETFTickData，供 ZMQ 广播
-        self.underlying_code = underlying_code
-
-
-class WindSubscriber:
+class WindSubscriber(DataProvider):
     """
     Wind 实时行情订阅器（Push 回调模式）
 
@@ -171,6 +160,10 @@ class WindSubscriber:
         return len(self._option_codes)
 
     @property
+    def active_underlyings(self) -> List[str]:
+        return sorted(set(self._products))
+
+    @property
     def underlying_map(self) -> Dict[str, str]:
         return dict(self._code_to_underlying)
 
@@ -180,15 +173,15 @@ class WindSubscriber:
 
     def _load_contracts(self) -> None:
         """从 CSV 加载合约信息，筛选出目标品种的活跃合约"""
-        optionchain_csv = get_optionchain_path(target_date=date.today())
+        optionchain_csv = get_optionchain_path(target_date=bj_today())
         if not optionchain_csv.exists():
             logger.error("optionchain 文件不存在: %s，请开盘前执行 python fetch_optionchain.py", optionchain_csv)
             return
 
         mgr = ContractInfoManager()
-        mgr.load_from_optionchain(optionchain_csv, target_date=date.today())
+        mgr.load_from_optionchain(optionchain_csv, target_date=bj_today())
 
-        today = date.today()
+        today = bj_today()
         product_set = set(self._products)
 
         n_adjusted = 0
@@ -270,7 +263,7 @@ class WindSubscriber:
             if indata.ErrorCode != 0:
                 logger.warning("期权 wsq 推送错误 ErrorCode=%d", indata.ErrorCode)
                 return
-            ts = datetime.now()
+            ts = bj_now_naive()
             for j, raw_code in enumerate(indata.Codes):
                 code = normalize_code(raw_code, ".SH")
                 underlying = c2u.get(code, "")
@@ -303,7 +296,7 @@ class WindSubscriber:
             if indata.ErrorCode != 0:
                 logger.warning("ETF wsq 推送错误 ErrorCode=%d", indata.ErrorCode)
                 return
-            ts = datetime.now()
+            ts = bj_now_naive()
             for j, raw_code in enumerate(indata.Codes):
                 code = normalize_code(raw_code, ".SH")
                 row = _parse_indata_row(indata, j)

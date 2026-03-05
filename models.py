@@ -8,10 +8,11 @@
 from __future__ import annotations
 
 import math
+from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from enum import Enum
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 
 # ============================================================
@@ -100,6 +101,37 @@ class ETFTickData:
     ask_price: float = math.nan # 卖一价
     bid_price: float = math.nan # 买一价
     is_simulated: bool = False  # 标记是否为模拟数据
+
+
+@dataclass
+class TickPacket:
+    """跨线程/跨模块传递的统一 tick 数据包。"""
+    is_etf: bool
+    tick_row: Dict[str, Any]
+    tick_obj: Any
+    underlying_code: str
+
+
+class DataProvider(ABC):
+    """统一数据采集接口。"""
+
+    @abstractmethod
+    def start(self) -> bool:
+        """启动采集。"""
+
+    @abstractmethod
+    def stop(self) -> None:
+        """停止采集。"""
+
+    @property
+    @abstractmethod
+    def option_count(self) -> int:
+        """当前期权订阅数量。"""
+
+    @property
+    def active_underlyings(self) -> List[str]:
+        """当前活跃标的。默认空列表。"""
+        return []
 
 
 # ============================================================

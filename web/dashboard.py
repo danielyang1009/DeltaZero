@@ -6,7 +6,9 @@ from __future__ import annotations
 
 from datetime import date, datetime
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Optional
+import threading
+import time
 
 import psutil
 from fastapi import FastAPI, HTTPException
@@ -19,27 +21,165 @@ from web.data_stats import (
     count_today_chunks,
     get_fetch_state,
     launch_fetch_task,
+    merge_status_readable,
     read_snapshot_stats,
     run_merge,
     snapshot_readable,
 )
 from web.process_manager import (
     arg_from_cmd,
-    count_wind_monitors,
     find_monitor_processes,
     find_recorder_processes,
+    find_infinitrader_processes,
+    _is_real_databus_proc,
+    _is_real_monitor_proc,
     process_info,
     safe_cmdline,
     spawn_module,
 )
+from utils.time_utils import bj_now_naive, bj_today
 
 TEMPLATE_PATH = Path(__file__).resolve().parent / "templates" / "index.html"
+DDE_TEMPLATE_PATH = Path(__file__).resolve().parent / "templates" / "dde.html"
 
 app = FastAPI(title="DeltaZero Web Console", version="0.3.0")
+_dde_lock = threading.Lock()
+_dde_feeder = None
+_dde_routes_cache: Dict[str, Any] = {"key": "", "routes": {}}
+
+_METADATA_DIR = Path(__file__).resolve().parent.parent / "metadata"
+_WIND_OPTIONCHAIN_PATH = _METADATA_DIR / "wind_50etf_optionchain.xlsx"
+_wind_optionchain_cache: Dict[str, Any] = {}
+
+
+def _excel_serial_to_date(serial) -> Optional[date]:
+    """Excel date serial number -> date (1900-based)."""
+    try:
+        n = int(float(serial))
+        if n < 1:
+            return None
+        from datetime import timedelta
+        return date(1899, 12, 30) + timedelta(days=n)
+    except (TypeError, ValueError):
+        return None
+
+
+def _load_wind_optionchain() -> Dict[str, Dict[str, Any]]:
+    """
+    解析 metadata/wind_*_optionchain.xlsx，返回 {合约代码(无后缀): {expiry_date, ...}}。
+    跳过末尾 Wind 水印行。结果会缓存。
+    """
+    import re as _re
+    import zipfile
+    import xml.etree.ElementTree as ET
+
+    if not _WIND_OPTIONCHAIN_PATH.exists():
+        return {}
+
+    fpath = str(_WIND_OPTIONCHAIN_PATH)
+    cache_key = f"{fpath}:{_WIND_OPTIONCHAIN_PATH.stat().st_mtime}"
+    if _wind_optionchain_cache.get("key") == cache_key:
+        return _wind_optionchain_cache["data"]
+
+    ns = {"s": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
+    col_re = _re.compile(r"([A-Z]+)")
+    result: Dict[str, Dict[str, Any]] = {}
+
+    try:
+        zf = zipfile.ZipFile(fpath)
+    except Exception:
+        return result
+
+    ss: list[str] = []
+    if "xl/sharedStrings.xml" in zf.namelist():
+        try:
+            root = ET.fromstring(zf.read("xl/sharedStrings.xml"))
+            for si in root.findall(".//s:si", ns):
+                parts = [t.text or "" for t in si.findall(".//s:t", ns)]
+                ss.append("".join(parts))
+        except Exception:
+            pass
+
+    for sheet_name in sorted(zf.namelist()):
+        if not sheet_name.startswith("xl/worksheets/sheet") or not sheet_name.endswith(".xml"):
+            continue
+        try:
+            root = ET.fromstring(zf.read(sheet_name))
+        except Exception:
+            continue
+        rows = root.findall(".//s:sheetData/s:row", ns)
+        for row in rows[1:]:
+            cell_map: Dict[str, str] = {}
+            for cell in row.findall("s:c", ns):
+                ref = cell.get("r", "")
+                m = col_re.match(ref)
+                if not m:
+                    continue
+                col = m.group(1)
+                t_attr = (cell.get("t") or "").strip()
+                v_elem = cell.find("s:v", ns)
+                val = v_elem.text if v_elem is not None and v_elem.text else ""
+                if t_attr == "s" and val:
+                    try:
+                        val = ss[int(val)]
+                    except (ValueError, IndexError):
+                        pass
+                cell_map[col] = val
+
+            code_raw = cell_map.get("A", "").strip()
+            if not code_raw or not code_raw[0].isdigit():
+                continue
+
+            code_bare = code_raw.replace(".SH", "").replace(".XSHG", "").strip()
+            if not code_bare.isdigit():
+                continue
+
+            expiry_d = _excel_serial_to_date(cell_map.get("G", ""))
+            result[code_bare] = {
+                "expiry_date": expiry_d,
+                "delivery_month": cell_map.get("H", ""),
+            }
+    zf.close()
+
+    _wind_optionchain_cache["key"] = cache_key
+    _wind_optionchain_cache["data"] = result
+    return result
+
+
+def _wind_optionchain_mtime_ago() -> str:
+    """返回 wind_50etf_optionchain.xlsx 距今多久未更新的描述文字。"""
+    if not _WIND_OPTIONCHAIN_PATH.exists():
+        return "文件不存在"
+    mtime = _WIND_OPTIONCHAIN_PATH.stat().st_mtime
+    delta = time.time() - mtime
+    if delta < 60:
+        return "刚刚"
+    if delta < 3600:
+        return f"{int(delta // 60)}分钟前"
+    if delta < 86400:
+        return f"{int(delta // 3600)}小时前"
+    return f"{int(delta // 86400)}天前"
+
+
+_WXY_50ETF_PATH = _METADATA_DIR / "wxy_50etf.xlsx"
+
+
+def _wxy_50etf_mtime_ago() -> str:
+    """返回 wxy_50etf.xlsx 距今多久未更新的描述文字。"""
+    if not _WXY_50ETF_PATH.exists():
+        return "文件不存在"
+    mtime = _WXY_50ETF_PATH.stat().st_mtime
+    delta = time.time() - mtime
+    if delta < 60:
+        return "刚刚"
+    if delta < 3600:
+        return f"{int(delta // 60)}分钟前"
+    if delta < 86400:
+        return f"{int(delta // 3600)}小时前"
+    return f"{int(delta // 86400)}天前"
 
 
 class MonitorStartRequest(BaseModel):
-    source: str = Field(default="zmq", pattern="^(wind|zmq)$")
     min_profit: float = 30.0
     expiry_days: int = 90
     refresh: int = 3
@@ -48,48 +188,403 @@ class MonitorStartRequest(BaseModel):
     snapshot_dir: str = DEFAULT_MARKET_DATA_DIR
 
 
+class DDEStartRequest(BaseModel):
+    interval: float = 3.0
+
+
+class RecorderStartRequest(BaseModel):
+    source: str = Field(default="wind", pattern="^(wind|dde)$")
+
+
+class DDEPipelineStartRequest(BaseModel):
+    zmq_port: int = 5555
+    refresh: int = 3
+    min_profit: float = 30.0
+    expiry_days: int = 90
+    atm_range: float = 0.20
+
+
 @app.get("/", response_class=HTMLResponse)
 def index() -> str:
     return TEMPLATE_PATH.read_text(encoding="utf-8")
+
+
+@app.get("/dde", response_class=HTMLResponse)
+def dde_page() -> str:
+    return DDE_TEMPLATE_PATH.read_text(encoding="utf-8")
+
+
+def _default_dde_excel_files() -> Dict[str, str]:
+    candidates = {
+        "510050.SH": "metadata/wxy_50etf.xlsx",
+        "510300.SH": "metadata/wxy_300etf.xlsx",
+        "510500.SH": "metadata/wxy_500etf.xlsx",
+    }
+    out: Dict[str, str] = {}
+    for code, rel in candidates.items():
+        if Path(rel).exists():
+            out[code] = rel
+    return out
+
+
+def _require_dde_running():
+    global _dde_feeder
+    if _dde_feeder is None:
+        raise HTTPException(status_code=409, detail="DDE 采集未启动，请先点击“启动 DDE”")
+    return _dde_feeder
+
+
+def _get_running_recorder_source() -> Optional[str]:
+    recs = find_recorder_processes()
+    if not recs:
+        return None
+    cmd = safe_cmdline(recs[0])
+    return arg_from_cmd(cmd, "--source", "wind").lower() or "wind"
+
+
+def _ensure_infinitrader_running() -> None:
+    """
+    启动 DDE 相关流程前，先确认交易终端已启动，避免 DataBus 启动后立即退出。
+    """
+    procs = find_infinitrader_processes()
+    if not procs:
+        raise HTTPException(
+            status_code=409,
+            detail="未检测到 InfiniTrader 进程，请先打开交易软件后再启动 DDE DataBus",
+        )
+
+
+def _get_cached_dde_routes() -> Dict[str, Any]:
+    """
+    懒解析 DDE 路由（用于在 recorder 模式补齐 strike/type/underlying 信息）。
+    """
+    excel_files = _default_dde_excel_files()
+    if not excel_files:
+        return {}
+    key_parts = []
+    for _, rel in sorted(excel_files.items()):
+        p = Path(rel)
+        if p.exists():
+            key_parts.append(f"{rel}:{p.stat().st_mtime}")
+    key = "|".join(key_parts)
+    if _dde_routes_cache.get("key") == key:
+        return _dde_routes_cache.get("routes", {})
+
+    try:
+        from data_engine.dde_adapter import DDERouteParser
+
+        parser = DDERouteParser(excel_files)
+        parser.parse()
+        routes = parser.routes
+    except Exception:
+        routes = {}
+    _dde_routes_cache["key"] = key
+    _dde_routes_cache["routes"] = routes
+    return routes
+
+
+def _poll_from_recorder_snapshot(wind_info: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    recorder 运行时，从 snapshot_latest.parquet 读取展示数据。
+    """
+    try:
+        import pandas as pd
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"读取 recorder 快照失败（缺少 pandas）: {exc}")
+
+    snap = Path(DEFAULT_MARKET_DATA_DIR) / "snapshot_latest.parquet"
+    if not snap.exists():
+        return {
+            "ok": True,
+            "time": bj_now_naive().strftime("%Y-%m-%d %H:%M:%S"),
+            "route_count": 0,
+            "rows": [],
+            "valid_last_count": 0,
+            "mode": "databus",
+        }
+
+    try:
+        df = pd.read_parquet(str(snap))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"读取 snapshot_latest.parquet 失败: {exc}")
+
+    routes = _get_cached_dde_routes()
+    rows = []
+    valid_last = 0
+    for _, rec in df.iterrows():
+        code = str(rec.get("code", "") or "").strip()
+        if not code:
+            continue
+        last = rec.get("last")
+        if isinstance(last, (int, float)):
+            valid_last += 1
+
+        route = routes.get(code) or routes.get(code.replace(".SH", "").replace(".XSHG", ""))
+        row_type = str(rec.get("type", "") or "").upper()
+        is_etf = row_type == "ETF" or (route is not None and route.option_type == "ETF")
+        strike_val = "" if is_etf else (route.strike if route else "")
+        underlying = ""
+        if route is not None:
+            underlying = (route.underlying or "").replace(".SH", "").replace(".XSHG", "")
+        if not underlying:
+            underlying = str(rec.get("underlying", "") or "").replace(".SH", "").replace(".XSHG", "")
+        if is_etf and not underlying:
+            underlying = code.replace(".SH", "").replace(".XSHG", "")
+
+        expiry_str = ""
+        if not is_etf:
+            code_bare = code.replace(".SH", "").replace(".XSHG", "")
+            info = wind_info.get(code_bare)
+            if info and info.get("expiry_date"):
+                expiry_str = info["expiry_date"].strftime("%Y-%m-%d")
+
+        rows.append(
+            {
+                "code": code,
+                "underlying": underlying,
+                "type": ("ETF" if is_etf else (route.option_type if route else "OPTION")),
+                "strike": strike_val,
+                "expiry": expiry_str,
+                "last": rec.get("last"),
+                "bid1": rec.get("bid1"),
+                "ask1": rec.get("ask1"),
+                # snapshot 不包含一档委托量，留空
+                "bidv1": None,
+                "askv1": None,
+            }
+        )
+
+    rows.sort(key=lambda r: (r["underlying"], r["type"], r["code"]))
+    return {
+        "ok": True,
+        "time": bj_now_naive().strftime("%Y-%m-%d %H:%M:%S"),
+        "route_count": len(rows),
+        "rows": rows,
+        "valid_last_count": valid_last,
+        "mode": "databus",
+    }
+
+
+@app.post("/api/dde/start")
+def start_dde(req: DDEStartRequest) -> Dict[str, Any]:
+    global _dde_feeder
+    _ensure_infinitrader_running()
+    with _dde_lock:
+        if _dde_feeder is not None:
+            raise HTTPException(status_code=409, detail="DDE 采集已在运行")
+
+        excel_files = _default_dde_excel_files()
+        if not excel_files:
+            raise HTTPException(status_code=400, detail="未找到 DDE 映射文件（metadata/wxy_*.xlsx）")
+
+        try:
+            from data_engine.dde_adapter import DDEDataFeeder
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"导入 DDE 模块失败: {exc}")
+
+        feeder = DDEDataFeeder(excel_files=excel_files, poll_interval=req.interval)
+        ok = feeder.start()
+        if not ok:
+            feeder.stop()
+            raise HTTPException(status_code=500, detail="DDE 启动失败，请检查交易软件/DDE 配置")
+        _dde_feeder = feeder
+        return {
+            "ok": True,
+            "interval": req.interval,
+            "route_count": len(feeder.routes),
+            "excel_files": excel_files,
+        }
+
+
+@app.post("/api/dde/stop")
+def stop_dde() -> Dict[str, Any]:
+    global _dde_feeder
+    with _dde_lock:
+        if _dde_feeder is None:
+            return {"ok": True, "running": False}
+        try:
+            _dde_feeder.stop()
+        finally:
+            _dde_feeder = None
+    return {"ok": True, "running": False}
+
+
+@app.get("/api/dde/state")
+def dde_state() -> Dict[str, Any]:
+    global _dde_feeder
+    running = _dde_feeder is not None
+    route_count = len(_dde_feeder.routes) if running else 0
+    recorder_source = _get_running_recorder_source()
+    return {
+        "running": running,
+        "route_count": route_count,
+        "optionchain_mtime": _wind_optionchain_mtime_ago(),
+        "data_mode": "databus" if recorder_source else "direct_dde",
+        "recorder_source": recorder_source,
+    }
+
+
+@app.get("/api/dde/poll")
+def dde_poll() -> Dict[str, Any]:
+    wind_info = _load_wind_optionchain()
+    recorder_source = _get_running_recorder_source()
+    if recorder_source:
+        return _poll_from_recorder_snapshot(wind_info)
+
+    if _dde_feeder is None:
+        return {
+            "ok": True,
+            "time": bj_now_naive().strftime("%Y-%m-%d %H:%M:%S"),
+            "route_count": 0,
+            "rows": [],
+            "valid_last_count": 0,
+        }
+
+    feeder = _dde_feeder
+    today = bj_today()
+    with _dde_lock:
+        data = feeder.poll_once()
+        rows = []
+        valid_last = 0
+        for code in sorted(data.keys()):
+            quote = data[code]
+            route = feeder.routes.get(code)
+            last = quote.get("LASTPRICE")
+            if isinstance(last, (float, int)):
+                valid_last += 1
+            is_etf = route and route.option_type == "ETF"
+            strike_val = "" if is_etf else (route.strike if route else "")
+            expiry_str = ""
+            underlying = (route.underlying if route else "").replace(".SH", "").replace(".XSHG", "").strip()
+            if not is_etf:
+                code_bare = code.replace(".SH", "").replace(".XSHG", "").strip()
+                info = wind_info.get(code_bare)
+                if info and info.get("expiry_date"):
+                    expiry_str = info["expiry_date"].strftime("%Y-%m-%d")
+            rows.append(
+                {
+                    "code": code,
+                    "underlying": underlying,
+                    "type": route.option_type if route else "",
+                    "strike": strike_val,
+                    "expiry": expiry_str,
+                    "last": quote.get("LASTPRICE"),
+                    "bid1": quote.get("BIDPRICE1"),
+                    "ask1": quote.get("ASKPRICE1"),
+                    "bidv1": quote.get("BIDVOLUME1"),
+                    "askv1": quote.get("ASKVOLUME1"),
+                }
+            )
+        return {
+            "ok": True,
+            "time": bj_now_naive().strftime("%Y-%m-%d %H:%M:%S"),
+            "route_count": len(feeder.routes),
+            "rows": rows,
+            "valid_last_count": valid_last,
+        }
+
+
+@app.get("/api/dde/diag")
+def dde_diag(code: Optional[str] = None, limit: int = 8) -> Dict[str, Any]:
+    """
+    DDE 诊断接口：返回原始值(raw) + 解析值(parsed) + 错误信息(error)。
+    - code: 指定单个合约代码（可选）
+    - limit: 未指定 code 时，最多诊断前 N 条合约
+    """
+    feeder = _require_dde_running()
+    with _dde_lock:
+        request_fields = feeder.client.request_fields
+        selected_codes: list[str]
+        if code:
+            if code not in feeder.routes:
+                raise HTTPException(status_code=404, detail=f"未找到合约: {code}")
+            selected_codes = [code]
+        else:
+            selected_codes = sorted(feeder.routes.keys())[: max(1, min(limit, 50))]
+
+        rows = []
+        total = 0
+        parsed_count = 0
+        error_count = 0
+        for c in selected_codes:
+            route = feeder.routes[c]
+            field_diag: Dict[str, Dict[str, Any]] = {}
+            for field in request_fields:
+                parsed, raw, err, ords = feeder.client.request_diagnostic(route.topic, field)
+                total += 1
+                if err:
+                    error_count += 1
+                if parsed is not None:
+                    parsed_count += 1
+                field_diag[field] = {
+                    "parsed": parsed,
+                    "raw_hex": raw,
+                    "error": err,
+                    "raw_len": len(ords),
+                }
+            rows.append(
+                {
+                    "code": c,
+                    "type": route.option_type,
+                    "topic": route.topic,
+                    "source": route.source_file,
+                    "fields": field_diag,
+                }
+            )
+
+        return {
+            "ok": True,
+            "time": bj_now_naive().strftime("%Y-%m-%d %H:%M:%S"),
+            "route_count": len(feeder.routes),
+            "selected_count": len(selected_codes),
+            "stats": {
+                "total_fields": total,
+                "parsed_fields": parsed_count,
+                "error_fields": error_count,
+            },
+            "rows": rows,
+        }
 
 
 @app.get("/api/state")
 def get_state() -> Dict[str, Any]:
     rec_procs = find_recorder_processes()
     mon_procs = find_monitor_processes()
-    all_procs = [process_info(p, "recorder") for p in rec_procs] + [process_info(p, "monitor") for p in mon_procs]
+    all_procs = [process_info(p, "databus") for p in rec_procs] + [process_info(p, "monitor") for p in mon_procs]
     snapshot_raw = read_snapshot_stats(DEFAULT_MARKET_DATA_DIR)
     chunks_raw = count_today_chunks(DEFAULT_MARKET_DATA_DIR)
+    merge_status = merge_status_readable(DEFAULT_MARKET_DATA_DIR, bj_today())
     return {
-        "server_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "server_time": bj_now_naive().strftime("%Y-%m-%d %H:%M:%S"),
         "processes": all_procs,
         "recorder_running": len(rec_procs) > 0,
         "recorder_count": len(rec_procs),
         "monitor_count": len(mon_procs),
         "snapshot": snapshot_readable(snapshot_raw),
         "chunks": chunks_readable(chunks_raw),
+        "merge_status": merge_status,
         "market_data_dir": DEFAULT_MARKET_DATA_DIR,
+        "metadata_files": {
+            "wind_50etf_optionchain": {"mtime_ago": _wind_optionchain_mtime_ago()},
+            "wxy_50etf": {"mtime_ago": _wxy_50etf_mtime_ago()},
+        },
     }
 
 
 @app.post("/api/processes/recorder/start")
-def start_recorder() -> Dict[str, Any]:
+def start_recorder(req: RecorderStartRequest) -> Dict[str, Any]:
     existing = find_recorder_processes()
     if existing:
-        raise HTTPException(status_code=409, detail=f"Recorder 已在运行 (PID {existing[0].pid})，请先关闭")
-    return {"ok": True, "started": spawn_module("data_recorder.recorder", [])}
+        raise HTTPException(status_code=409, detail=f"DataBus 已在运行 (PID {existing[0].pid})，请先关闭")
+    if req.source == "dde":
+        _ensure_infinitrader_running()
+    args = ["--source", req.source]
+    return {"ok": True, "started": spawn_module("data_bus.bus", args)}
 
 
 @app.post("/api/processes/monitor/start")
 def start_monitor(req: MonitorStartRequest) -> Dict[str, Any]:
-    if req.source == "wind" and count_wind_monitors() >= 1:
-        raise HTTPException(
-            status_code=409,
-            detail="Wind 模式仅支持单实例（Wind API 不支持多进程并发连接），请先关闭已有 Monitor 或改用 ZMQ 模式",
-        )
     args = [
-        "--source",
-        req.source,
         "--min-profit",
         str(req.min_profit),
         "--expiry-days",
@@ -98,10 +593,47 @@ def start_monitor(req: MonitorStartRequest) -> Dict[str, Any]:
         str(req.refresh),
         "--atm-range",
         str(req.atm_range),
+        "--zmq-port",
+        str(req.zmq_port),
+        "--snapshot-dir",
+        req.snapshot_dir,
     ]
-    if req.source == "zmq":
-        args += ["--zmq-port", str(req.zmq_port), "--snapshot-dir", req.snapshot_dir]
     return {"ok": True, "started": spawn_module("monitors.monitor", args)}
+
+
+@app.post("/api/pipelines/dde/start")
+def start_dde_pipeline(req: DDEPipelineStartRequest) -> Dict[str, Any]:
+    """
+    一键启动 DDE 链路：
+    DDE DataBus (--source dde) -> Monitor
+    """
+    existing_rec = find_recorder_processes()
+    existing_mon = find_monitor_processes()
+    if existing_rec:
+        raise HTTPException(status_code=409, detail=f"DataBus 已在运行 (PID {existing_rec[0].pid})，请先关闭")
+    if existing_mon:
+        raise HTTPException(status_code=409, detail=f"Monitor 已在运行 (PID {existing_mon[0].pid})，请先关闭")
+    _ensure_infinitrader_running()
+
+    rec_started = spawn_module("data_bus.bus", ["--source", "dde", "--port", str(req.zmq_port)])
+    # 给 recorder 一点启动时间，避免 monitor 过早连接
+    time.sleep(0.8)
+    mon_args = [
+        "--zmq-port", str(req.zmq_port),
+        "--snapshot-dir", DEFAULT_MARKET_DATA_DIR,
+        "--min-profit", str(req.min_profit),
+        "--expiry-days", str(req.expiry_days),
+        "--refresh", str(req.refresh),
+        "--atm-range", str(req.atm_range),
+    ]
+    mon_started = spawn_module("monitors.monitor", mon_args)
+    return {
+        "ok": True,
+        "pipeline": "dde->databus->monitor",
+        "recorder": rec_started,
+        "monitor": mon_started,
+        "zmq_port": req.zmq_port,
+    }
 
 
 @app.post("/api/processes/{pid}/kill")
@@ -129,15 +661,14 @@ def reopen_process(pid: int) -> Dict[str, Any]:
         raise HTTPException(status_code=404, detail="进程不存在")
 
     cmd = safe_cmdline(proc)
-    joined = " ".join(cmd).lower()
-
-    if "recorder" in joined and "monitor" not in joined:
-        module, args = "data_recorder.recorder", []
-    elif "monitor" in joined:
+    if _is_real_databus_proc(proc):
+        module = "data_bus.bus"
+        args = ["--source", arg_from_cmd(cmd, "--source", "wind")]
+        if "--no-persist" in cmd:
+            args.append("--no-persist")
+    elif _is_real_monitor_proc(proc):
         module = "monitors.monitor"
         args = [
-            "--source",
-            arg_from_cmd(cmd, "--source", "wind"),
             "--min-profit",
             arg_from_cmd(cmd, "--min-profit", "30"),
             "--expiry-days",
@@ -146,14 +677,11 @@ def reopen_process(pid: int) -> Dict[str, Any]:
             arg_from_cmd(cmd, "--refresh", "3"),
             "--atm-range",
             arg_from_cmd(cmd, "--atm-range", "0.20"),
+            "--zmq-port",
+            arg_from_cmd(cmd, "--zmq-port", "5555"),
+            "--snapshot-dir",
+            arg_from_cmd(cmd, "--snapshot-dir", DEFAULT_MARKET_DATA_DIR),
         ]
-        if arg_from_cmd(cmd, "--source", "wind") == "zmq":
-            args += [
-                "--zmq-port",
-                arg_from_cmd(cmd, "--zmq-port", "5555"),
-                "--snapshot-dir",
-                arg_from_cmd(cmd, "--snapshot-dir", DEFAULT_MARKET_DATA_DIR),
-            ]
     else:
         raise HTTPException(status_code=400, detail="无法识别进程类型")
 
@@ -187,7 +715,7 @@ def kill_all() -> Dict[str, Any]:
 
 @app.post("/api/actions/fetch-optionchain")
 def start_fetch_optionchain() -> Dict[str, Any]:
-    today_str = date.today().strftime("%Y-%m-%d")
+    today_str = bj_today().strftime("%Y-%m-%d")
     if not launch_fetch_task(today_str):
         raise HTTPException(status_code=409, detail="期权链抓取正在进行中")
     return {"ok": True, "date": today_str}
@@ -200,7 +728,7 @@ def fetch_status() -> Dict[str, Any]:
 
 @app.post("/api/actions/merge")
 def run_merge_api() -> Dict[str, Any]:
-    return run_merge(date.today(), DEFAULT_MARKET_DATA_DIR)
+    return run_merge(bj_today(), DEFAULT_MARKET_DATA_DIR)
 
 
 def main() -> None:

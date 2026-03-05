@@ -5,6 +5,10 @@ Wind API 适配器
 在无 Wind 环境下优雅降级为 Mock 模式，不影响回测流程。
 
 注意：使用本模块需要已安装 WindPy 并登录 Wind 终端。
+
+说明：
+  本模块保留为通用 Wind 访问封装（实时/历史/合约查询）。
+  生产实时总线请优先使用 data_bus/wind_subscriber.py。
 """
 
 from __future__ import annotations

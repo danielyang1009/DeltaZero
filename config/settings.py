@@ -135,6 +135,8 @@ class RecorderConfig:
 
     # 存储路径（统一为 D:\MARKET_DATA）
     output_dir: str = DEFAULT_MARKET_DATA_DIR
+    # 是否落盘（False 时仅走总线广播）
+    persist: bool = True
 
     # ZeroMQ 发布端口
     zmq_port: int = 5555

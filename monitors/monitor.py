@@ -3,8 +3,7 @@
 DeltaZero — PCP 正向套利实时监控
 
 运行方法:
-    python monitor.py                          # 直连 Wind（默认）
-    python monitor.py --source zmq             # 从 recorder 进程读取
+    python monitor.py                          # 从 data_bus 进程读取（默认）
     python monitor.py --min-profit 150         # 净利润阈值
     python monitor.py --expiry-days 30         # 只看近月合约
     python monitor.py --refresh 3              # 每3秒刷新
@@ -15,9 +14,8 @@ from __future__ import annotations
 import argparse
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from collections import defaultdict
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -47,16 +45,9 @@ from config.settings import DEFAULT_MARKET_DATA_DIR, UNDERLYINGS
 from models import (
     ETFTickData,
     TradeSignal,
-    normalize_code,
 )
 from calculators.vix_engine import VIXEngine, VIXResult
 from strategies.pcp_arbitrage import PCPArbitrage
-from utils.wind_helpers import (
-    fval,
-    wind_connect,
-    wind_row_to_etf_tick,
-    wind_row_to_option_tick,
-)
 
 console = Console(legacy_windows=False, highlight=True)
 
@@ -67,56 +58,6 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
     stream=sys.stderr,
 )
-
-# ──────────────────────────────────────────────────────────────────────
-# Wind 行情工具（仅 Wind 模式使用）
-# ──────────────────────────────────────────────────────────────────────
-
-WIND_OPTION_FIELDS = "rt_last,rt_ask1,rt_bid1"
-WIND_ETF_FIELDS = "rt_last,rt_ask1,rt_bid1"
-WIND_BATCH_SIZE = 300
-
-
-def poll_snapshot(
-    w,
-    codes: List[str],
-    fields: str = WIND_OPTION_FIELDS,
-    cancel_before: bool = False,
-    timeout_sec: int = 5,
-) -> Dict[str, Dict[str, float]]:
-    """批量拉取 Wind 实时行情快照（同步 wsq）"""
-    if cancel_before:
-        try:
-            w.cancelRequest(0)
-        except Exception:
-            pass
-
-    out: Dict[str, Dict[str, float]] = {}
-    for i in range(0, len(codes), WIND_BATCH_SIZE):
-        if i > 0:
-            try:
-                w.cancelRequest(0)
-            except Exception:
-                pass
-        batch = codes[i : i + WIND_BATCH_SIZE]
-        try:
-            with ThreadPoolExecutor(max_workers=1) as ex:
-                result = ex.submit(w.wsq, ",".join(batch), fields).result(timeout=timeout_sec)
-        except (FuturesTimeoutError, Exception):
-            continue
-        if result is None or result.ErrorCode != 0:
-            continue
-        field_names = [f.upper() for f in result.Fields]
-        for j, raw_code in enumerate(result.Codes):
-            row: Dict[str, float] = {}
-            for k, fn in enumerate(field_names):
-                try:
-                    row[fn] = result.Data[k][j]
-                except (IndexError, TypeError):
-                    row[fn] = None
-            out[normalize_code(raw_code, ".SH")] = row
-    return out
-
 
 # ──────────────────────────────────────────────────────────────────────
 # Rich 显示构建
@@ -211,19 +152,26 @@ def _build_etf_table(
             sig.calc_detail,
         )
 
-    normal = sorted(
-        [s for s in sigs if not s.is_adjusted], key=lambda s: (s.expiry, s.strike)
-    )
-    adjusted = sorted(
-        [s for s in sigs if s.is_adjusted], key=lambda s: (s.expiry, s.strike)
-    )
+    by_expiry: Dict[date, List[TradeSignal]] = defaultdict(list)
+    for sig in sigs:
+        by_expiry[sig.expiry].append(sig)
 
-    for sig in normal:
-        _add_sig_row(sig)
-    if adjusted and normal:
-        tbl.add_section()
-    for sig in adjusted:
-        _add_sig_row(sig)
+    first_group = True
+    for expiry in sorted(by_expiry):
+        group = by_expiry[expiry]
+        normal = sorted([s for s in group if not s.is_adjusted], key=lambda s: s.strike)
+        adjusted = sorted([s for s in group if s.is_adjusted], key=lambda s: s.strike)
+
+        if not first_group:
+            tbl.add_section()
+        first_group = False
+
+        for sig in normal:
+            _add_sig_row(sig)
+        if adjusted and normal:
+            tbl.add_section()
+        for sig in adjusted:
+            _add_sig_row(sig)
 
     return tbl
 
@@ -280,7 +228,7 @@ def build_display(
 
 
 # ──────────────────────────────────────────────────────────────────────
-# 主逻辑：Wind 模式
+# 主逻辑：ZMQ 模式
 # ──────────────────────────────────────────────────────────────────────
 
 def run_monitor(
@@ -288,124 +236,10 @@ def run_monitor(
     expiry_days: int = 90,
     refresh_secs: int = 3,
     atm_range_pct: float = 0.20,
-) -> None:
-    """Wind 直连监控主循环"""
-    console.print("[bold]正在导入 WindPy...[/bold]", end=" ")
-    try:
-        from WindPy import w
-    except ImportError:
-        console.print("[red]失败：WindPy 未安装[/red]")
-        return
-    console.print("[green]OK[/green]")
-
-    console.print("[bold]正在连接 Wind 终端...[/bold]", end=" ")
-    if not wind_connect(w, timeout=30, retries=3, delay_secs=2.0, logger=logging.getLogger(__name__)):
-        console.print("[red]失败（Wind 连接超时或重试耗尽）[/red]")
-        return
-    console.print("[green]连接成功[/green]")
-
-    etf_prices: Dict[str, float] = {}
-    try:
-        strategy, contract_mgr, active, pairs, option_codes, etf_codes = (
-            init_strategy_and_contracts(
-                min_profit, expiry_days, atm_range_pct, etf_prices,
-                log_fn=lambda msg: console.print(msg),
-            )
-        )
-    except (FileNotFoundError, RuntimeError) as e:
-        console.print(f"[red]{e}[/red]")
-        w.stop()
-        return
-
-    # Wind 初始 ETF 价格
-    etf_snap = poll_snapshot(w, etf_codes, WIND_ETF_FIELDS)
-    for code in etf_codes:
-        q = etf_snap.get(code, {})
-        px = fval(q, "RT_LAST", 0.0)
-        name = ETF_NAME_MAP.get(code.split(".")[0], code)
-        if px > 0:
-            etf_prices[code] = px
-            console.print(f"  {name} ({code}): [yellow]{px:.4f}[/yellow]")
-        elif code not in etf_prices:
-            console.print(f"  {name} ({code}): [dim]使用估算 {etf_prices.get(code, 0):.4f}[/dim]")
-
-    console.print(
-        f"\n[bold green]开始实时监控[/bold green]  "
-        f"刷新间隔 {refresh_secs}s  最小利润 {min_profit:.0f} 元  按 Ctrl+C 退出\n"
-    )
-
-    iteration = 0
-    last_signals: List[TradeSignal] = []
-    etf_display: Dict[str, float] = dict(etf_prices)
-    vix_engine = VIXEngine(risk_free_rate=strategy.config.risk_free_rate)
-    vix_pairs, vix_option_codes = build_pairs_and_codes(
-        contract_mgr, active, etf_prices, atm_range_pct=10.0
-    )
-    option_codes = sorted(set(option_codes) | set(vix_option_codes))
-    vix_pairs_by_underlying: Dict[str, list] = {
-        u: [p for p in vix_pairs if p[0].underlying_code == u] for u in _VIX_TARGETS
-    }
-    vix_last: Dict[str, VIXResult] = {}
-    vix_display: Dict[str, Optional[float]] = {u: None for u in _VIX_TARGETS}
-
-    def render() -> RenderGroup:
-        return build_display(
-            last_signals, datetime.now(), etf_display, vix_display,
-            len(pairs), len(option_codes), iteration, min_profit,
-        )
-
-    try:
-        with Live(render(), console=console, refresh_per_second=0.5, screen=True) as live:
-            while True:
-                ts = datetime.now()
-                etf_snap = poll_snapshot(w, etf_codes, WIND_ETF_FIELDS, cancel_before=True)
-                for code, q in etf_snap.items():
-                    tick = wind_row_to_etf_tick(code, q, ts)
-                    if tick:
-                        strategy.on_etf_tick(tick)
-                        etf_display[code] = tick.price
-
-                opt_snap = poll_snapshot(w, option_codes, WIND_OPTION_FIELDS)
-                for code, q in opt_snap.items():
-                    tick = wind_row_to_option_tick(code, q, ts)
-                    if tick:
-                        strategy.on_option_tick(tick)
-
-                last_signals = strategy.scan_pairs_for_display(pairs, current_time=ts)
-                for u in _VIX_TARGETS:
-                    result = vix_engine.compute_for_underlying(
-                        vix_pairs_by_underlying.get(u, []),
-                        strategy.aligner,
-                        ts,
-                        last_result=vix_last.get(u),
-                        enable_republication=True,
-                    )
-                    if result is not None:
-                        vix_last[u] = result
-                        vix_display[u] = result.vix
-                iteration += 1
-                live.update(render())
-                time.sleep(refresh_secs)
-    except KeyboardInterrupt:
-        pass
-    finally:
-        w.stop()
-        console.print("\n[yellow]监控已停止，Wind 连接已断开[/yellow]")
-
-
-# ──────────────────────────────────────────────────────────────────────
-# 主逻辑：ZMQ 模式
-# ──────────────────────────────────────────────────────────────────────
-
-def run_monitor_zmq(
-    min_profit: float = 30.0,
-    expiry_days: int = 90,
-    refresh_secs: int = 3,
-    atm_range_pct: float = 0.20,
     zmq_port: int = 5555,
     snapshot_dir: str = DEFAULT_MARKET_DATA_DIR,
 ) -> None:
-    """ZMQ 订阅模式监控：从 data_recorder 进程接收实时行情。"""
+    """ZMQ 订阅模式监控：从 data_bus 进程接收实时行情。"""
     try:
         import zmq
     except ImportError:
@@ -456,6 +290,8 @@ def run_monitor_zmq(
     last_scan = datetime.now()
     last_signals: List[TradeSignal] = []
     etf_display = dict(etf_prices)
+    # 仅展示“当前实时流里出现过”的标的，避免历史快照把未订阅品种带出来
+    stream_underlyings: set[str] = set()
     vix_engine = VIXEngine(risk_free_rate=strategy.config.risk_free_rate)
     vix_pairs, vix_option_codes = build_pairs_and_codes(
         contract_mgr, active, etf_prices, atm_range_pct=10.0
@@ -488,16 +324,28 @@ def run_monitor_zmq(
                         if isinstance(tick, ETFTickData):
                             strategy.on_etf_tick(tick)
                             etf_display[tick.etf_code] = tick.price
+                            stream_underlyings.add(tick.etf_code)
                         else:
                             strategy.on_option_tick(tick)
+                            info = contract_mgr.get_info(tick.contract_code)
+                            if info is not None:
+                                stream_underlyings.add(info.underlying_code)
                     msgs_recv += 1
 
                 now = datetime.now()
                 # 收到新数据即刷新；无数据时按 refresh_secs 周期刷新
                 should_refresh = msgs_recv > 0 or (now - last_scan).total_seconds() >= refresh_secs
                 if should_refresh:
-                    last_signals = strategy.scan_pairs_for_display(pairs, current_time=now)
-                    for u in _VIX_TARGETS:
+                    if stream_underlyings:
+                        pairs_for_scan = [p for p in pairs if p[0].underlying_code in stream_underlyings]
+                        etf_display_view = {k: v for k, v in etf_display.items() if k in stream_underlyings}
+                    else:
+                        # 尚未收到实时流时，维持原行为（通常只持续很短时间）
+                        pairs_for_scan = pairs
+                        etf_display_view = etf_display
+
+                    last_signals = strategy.scan_pairs_for_display(pairs_for_scan, current_time=now)
+                    for u in [x for x in _VIX_TARGETS if x in etf_display_view]:
                         result = vix_engine.compute_for_underlying(
                             vix_pairs_by_underlying.get(u, []),
                             strategy.aligner,
@@ -510,7 +358,12 @@ def run_monitor_zmq(
                             vix_display[u] = result.vix
                     iteration += 1
                     last_scan = now
-                    live.update(render())
+                    def render_filtered() -> RenderGroup:
+                        return build_display(
+                            last_signals, datetime.now(), etf_display_view, vix_display,
+                            len(pairs_for_scan), len(option_codes), iteration, min_profit,
+                        )
+                    live.update(render_filtered())
 
     except KeyboardInterrupt:
         pass
@@ -530,21 +383,16 @@ def parse_args() -> argparse.Namespace:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例:
-  python monitor.py                          # 直连 Wind（默认）
-  python monitor.py --source zmq             # 从 recorder 进程读取
+  python monitor.py                          # 从 data_bus 进程读取
   python monitor.py --min-profit 150         # 净利润阈值
   python monitor.py --expiry-days 30         # 只看近月合约
   python monitor.py --refresh 3              # 每3秒刷新
-  python monitor.py --source zmq --zmq-port 5556
+  python monitor.py --zmq-port 5556
 """,
-    )
-    parser.add_argument(
-        "--source", choices=["wind", "zmq"], default="wind",
-        help="数据来源：wind=直连Wind（默认），zmq=从recorder进程读取",
     )
     parser.add_argument("--min-profit", type=float, default=30.0, help="最小显示净利润（元/组）")
     parser.add_argument("--expiry-days", type=int, default=90, help="最大到期天数")
-    parser.add_argument("--refresh", type=int, default=3, help="刷新间隔（秒），ZMQ 模式收到新数据会立即刷新")
+    parser.add_argument("--refresh", type=int, default=3, help="刷新间隔（秒），收到新数据会立即刷新")
     parser.add_argument("--atm-range", type=float, default=0.20, help="ATM 距离过滤比例")
     parser.add_argument("--zmq-port", type=int, default=5555, help="ZMQ PUB 端口")
     parser.add_argument("--snapshot-dir", type=str, default=DEFAULT_MARKET_DATA_DIR, help="快照文件目录")
@@ -553,19 +401,11 @@ def parse_args() -> argparse.Namespace:
 
 if __name__ == "__main__":
     args = parse_args()
-    if args.source == "zmq":
-        run_monitor_zmq(
-            min_profit=args.min_profit,
-            expiry_days=args.expiry_days,
-            refresh_secs=args.refresh,
-            atm_range_pct=args.atm_range,
-            zmq_port=args.zmq_port,
-            snapshot_dir=args.snapshot_dir,
-        )
-    else:
-        run_monitor(
-            min_profit=args.min_profit,
-            expiry_days=args.expiry_days,
-            refresh_secs=args.refresh,
-            atm_range_pct=args.atm_range,
-        )
+    run_monitor(
+        min_profit=args.min_profit,
+        expiry_days=args.expiry_days,
+        refresh_secs=args.refresh,
+        atm_range_pct=args.atm_range,
+        zmq_port=args.zmq_port,
+        snapshot_dir=args.snapshot_dir,
+    )

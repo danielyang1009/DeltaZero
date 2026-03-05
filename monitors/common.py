@@ -35,7 +35,7 @@ from models import (
     TradeSignal,
 )
 from config.settings import ETF_CODE_TO_NAME, UNDERLYINGS, TradingConfig, get_default_config
-from data_engine.contract_info import ContractInfoManager, get_optionchain_path
+from data_engine.contract_catalog import ContractInfoManager, get_optionchain_path
 from strategies.pcp_arbitrage import PCPArbitrage
 
 logger = logging.getLogger(__name__)

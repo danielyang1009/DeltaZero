@@ -20,11 +20,48 @@ def cmdline_str(proc: psutil.Process) -> str:
         return ""
 
 
+def _is_real_databus_proc(proc: psutil.Process) -> bool:
+    tokens = [t.lower() for t in safe_cmdline(proc)]
+    if not tokens:
+        return False
+    if "-m" in tokens:
+        try:
+            mod = tokens[tokens.index("-m") + 1]
+            if mod in {"data_bus.bus", "data_recorder.recorder"}:
+                return True
+        except Exception:
+            pass
+    # 兼容直接脚本启动：python data_bus/bus.py ...
+    for t in tokens:
+        norm = t.replace("\\", "/")
+        if norm.endswith("/data_bus/bus.py") or norm.endswith("/data_recorder/recorder.py"):
+            return True
+    return False
+
+
+def _is_real_monitor_proc(proc: psutil.Process) -> bool:
+    tokens = [t.lower() for t in safe_cmdline(proc)]
+    if not tokens:
+        return False
+    if "-m" in tokens:
+        try:
+            mod = tokens[tokens.index("-m") + 1]
+            if mod == "monitors.monitor":
+                return True
+        except Exception:
+            pass
+    # Also support direct script invocation: python monitors/monitor.py ...
+    for t in tokens:
+        norm = t.replace("\\", "/")
+        if norm.endswith("/monitors/monitor.py"):
+            return True
+    return False
+
+
 def find_recorder_processes() -> List[psutil.Process]:
     result = []
     for proc in psutil.process_iter(["pid", "cmdline", "create_time"]):
-        cmd = cmdline_str(proc).lower()
-        if "recorder" in cmd and "monitor" not in cmd and "console" not in cmd and "dashboard" not in cmd:
+        if _is_real_databus_proc(proc):
             result.append(proc)
     return result
 
@@ -32,8 +69,29 @@ def find_recorder_processes() -> List[psutil.Process]:
 def find_monitor_processes() -> List[psutil.Process]:
     result = []
     for proc in psutil.process_iter(["pid", "cmdline", "create_time"]):
+        if _is_real_monitor_proc(proc):
+            result.append(proc)
+    return result
+
+
+def find_infinitrader_processes() -> List[psutil.Process]:
+    """
+    查找 InfiniTrader 相关进程。
+
+    说明：
+    - 不同安装版本进程名可能略有差异（infinitrader/infinitrade）。
+    - 这里同时匹配进程名与命令行，提高兼容性。
+    """
+    keys = ("infinitrader", "infinitrade")
+    result: List[psutil.Process] = []
+    for proc in psutil.process_iter(["pid", "name", "cmdline", "create_time"]):
+        try:
+            name = (proc.info.get("name") or "").lower()
+        except (psutil.AccessDenied, psutil.NoSuchProcess):
+            name = ""
         cmd = cmdline_str(proc).lower()
-        if "monitor" in cmd and "console" not in cmd and "dashboard" not in cmd:
+        hay = f"{name} {cmd}"
+        if any(k in hay for k in keys):
             result.append(proc)
     return result
 
@@ -66,29 +124,24 @@ def uptime_human(proc: psutil.Process) -> str:
     return f"{s}s"
 
 
-def count_wind_monitors() -> int:
-    n = 0
-    for proc in find_monitor_processes():
-        cmd = safe_cmdline(proc)
-        if arg_from_cmd(cmd, "--source", "wind").lower() == "wind":
-            n += 1
-    return n
-
-
 def process_info(proc: psutil.Process, kind: str) -> Dict[str, Any]:
     cmd = safe_cmdline(proc)
     params = ""
     restart_args: List[str] = []
-    if kind == "recorder":
-        params = f"port={arg_from_cmd(cmd, '--port', '5555')} flush={arg_from_cmd(cmd, '--flush', '30')}"
-    elif kind == "monitor":
+    if kind == "databus":
         src = arg_from_cmd(cmd, "--source", "wind")
+        persist = "off" if "--no-persist" in cmd else "on"
+        params = (
+            f"source={src} "
+            f"port={arg_from_cmd(cmd, '--port', '5555')} "
+            f"flush={arg_from_cmd(cmd, '--flush', '30')} "
+            f"persist={persist}"
+        )
+    elif kind == "monitor":
         mp = arg_from_cmd(cmd, "--min-profit", "30")
         ed = arg_from_cmd(cmd, "--expiry-days", "90")
-        params = f"source={src} profit≥{mp} expiry≤{ed}d"
+        params = f"source=zmq profit≥{mp} expiry≤{ed}d"
         restart_args = [
-            "--source",
-            src,
             "--min-profit",
             mp,
             "--expiry-days",
@@ -97,14 +150,11 @@ def process_info(proc: psutil.Process, kind: str) -> Dict[str, Any]:
             arg_from_cmd(cmd, "--refresh", "3"),
             "--atm-range",
             arg_from_cmd(cmd, "--atm-range", "0.20"),
+            "--zmq-port",
+            arg_from_cmd(cmd, "--zmq-port", "5555"),
+            "--snapshot-dir",
+            arg_from_cmd(cmd, "--snapshot-dir", DEFAULT_MARKET_DATA_DIR),
         ]
-        if src == "zmq":
-            restart_args += [
-                "--zmq-port",
-                arg_from_cmd(cmd, "--zmq-port", "5555"),
-                "--snapshot-dir",
-                arg_from_cmd(cmd, "--snapshot-dir", DEFAULT_MARKET_DATA_DIR),
-            ]
     return {
         "pid": proc.pid,
         "kind": kind,
