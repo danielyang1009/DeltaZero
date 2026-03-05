@@ -133,6 +133,10 @@ class DataProvider(ABC):
         """当前活跃标的。默认空列表。"""
         return []
 
+    def is_trading_safe(self, underlying: str) -> bool:
+        """默认安全；子类可覆盖实现熔断逻辑。"""
+        return True
+
 
 # ============================================================
 # 合约基本信息

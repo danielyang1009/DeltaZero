@@ -22,7 +22,7 @@ import xml.etree.ElementTree as ET
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from queue import Queue
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from data_engine.dde_adapter import DDERouteParser, DDEClientManager, RouteEntry
 from models import DataProvider, ETFTickData, TickData, TickPacket, normalize_code
@@ -33,6 +33,10 @@ logger = logging.getLogger(__name__)
 _NS_MAIN = {"s": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
 _COL_RE = re.compile(r"([A-Z]+)")
 _WIND_CHAIN_GLOB = "metadata/wind_*_optionchain.xlsx"
+
+_HEALTH_ACTIVE = "ACTIVE"
+_HEALTH_STALE = "STALE"
+_CORE_FIELDS = ("LASTPRICE", "BIDPRICE1", "ASKPRICE1")
 
 
 class DDESubscriber(DataProvider):
@@ -46,10 +50,12 @@ class DDESubscriber(DataProvider):
         products: List[str],
         tick_queue: Queue,
         poll_interval: float = 3.0,
+        staleness_timeout: float = 30.0,
     ) -> None:
         self._products = list(products)
         self._queue = tick_queue
         self._poll_interval = max(0.5, float(poll_interval))
+        self._staleness_timeout = max(1.0, float(staleness_timeout))
         self._is_running = False
         self._thread: Optional[threading.Thread] = None
 
@@ -63,6 +69,14 @@ class DDESubscriber(DataProvider):
         self._code_to_underlying: Dict[str, str] = {}
         self._code_multiplier: Dict[str, int] = {}
         self._code_is_adjusted: set[str] = set()
+
+        # Health check state
+        self._prev_values: Dict[str, Dict[str, Optional[float]]] = {}
+        self._last_change_ts: Dict[str, float] = {}
+        self._contract_status: Dict[str, str] = {}
+        self._product_fused: Dict[str, bool] = {}
+        self._etf_prices: Dict[str, float] = {}
+        self._health_lock = threading.Lock()
 
     @property
     def option_count(self) -> int:
@@ -93,6 +107,16 @@ class DDESubscriber(DataProvider):
         # 加载 multiplier/is_adjusted 信息（缺失则 fallback）
         self._load_optionchain_info()
         self._build_code_maps_from_routes()
+
+        now = time.time()
+        with self._health_lock:
+            for code in self._routes:
+                self._last_change_ts.setdefault(code, now)
+                self._contract_status.setdefault(code, _HEALTH_ACTIVE)
+            for entry in self._routes.values():
+                key = self._underlying_key(entry)
+                if key:
+                    self._product_fused.setdefault(key, False)
 
         self._is_running = True
         self._thread = threading.Thread(target=self._poll_loop, name="dde-subscriber", daemon=True)
@@ -130,6 +154,125 @@ class DDESubscriber(DataProvider):
             self._client = None
         logger.info("DDE 订阅已停止")
 
+    def is_trading_safe(self, underlying: str) -> bool:
+        key = normalize_code((underlying or "").strip(), ".SH")
+        if not key:
+            return True
+        with self._health_lock:
+            return not self._product_fused.get(key, False)
+
+    def get_health_report(self) -> Dict[str, Any]:
+        with self._health_lock:
+            now = time.time()
+            stale_seconds = {
+                code: max(0.0, now - self._last_change_ts.get(code, now))
+                for code in self._contract_status
+            }
+            return {
+                "contract_status": dict(self._contract_status),
+                "product_fused": dict(self._product_fused),
+                "etf_prices": dict(self._etf_prices),
+                "stale_seconds": stale_seconds,
+                "timeout": self._staleness_timeout,
+            }
+
+    def _underlying_key(self, entry: RouteEntry, raw_code: str = "") -> str:
+        if entry.option_type == "ETF":
+            return normalize_code(entry.contract_code, ".SH")
+        if entry.underlying:
+            return normalize_code(entry.underlying, ".SH")
+        if raw_code:
+            return self._code_to_underlying.get(normalize_code(raw_code, ".SH"), "")
+        return ""
+
+    def _snapshot_fused_map(self) -> Dict[str, bool]:
+        with self._health_lock:
+            return dict(self._product_fused)
+
+    def _update_staleness(self, data: Dict[str, Dict[str, Optional[float]]]) -> None:
+        now = time.time()
+        with self._health_lock:
+            for code, row in data.items():
+                prev = self._prev_values.get(code, {})
+                changed = any(row.get(field) != prev.get(field) for field in _CORE_FIELDS)
+                if changed:
+                    self._last_change_ts[code] = now
+                    self._contract_status[code] = _HEALTH_ACTIVE
+                else:
+                    last_ts = self._last_change_ts.get(code, now)
+                    elapsed = now - last_ts
+                    if elapsed > self._staleness_timeout:
+                        if self._contract_status.get(code) != _HEALTH_STALE:
+                            logger.warning("合约 %s 数据陈旧 %.1fs，标记 STALE", code, elapsed)
+                        self._contract_status[code] = _HEALTH_STALE
+                    else:
+                        self._contract_status[code] = _HEALTH_ACTIVE
+                self._prev_values[code] = dict(row)
+
+            for code, entry in self._routes.items():
+                if entry.option_type != "ETF":
+                    continue
+                last = _f(data.get(code, {}).get("LASTPRICE"))
+                if _is_valid_price(last):
+                    key = self._underlying_key(entry, code)
+                    if key:
+                        self._etf_prices[key] = last
+
+            self._evaluate_circuit_breakers_locked()
+
+    def _evaluate_circuit_breakers_locked(self) -> None:
+        groups: Dict[str, List[str]] = {}
+        for code, entry in self._routes.items():
+            if entry.option_type == "ETF":
+                continue
+            key = self._underlying_key(entry, code)
+            if not key:
+                continue
+            groups.setdefault(key, []).append(code)
+
+        for underlying, codes in groups.items():
+            etf_price = self._etf_prices.get(underlying, 0.0)
+            atm_codes = self._find_atm_contracts(codes, etf_price)
+            watched_codes = atm_codes if atm_codes else codes
+            stale_count = sum(1 for c in watched_codes if self._contract_status.get(c) == _HEALTH_STALE)
+
+            was_fused = self._product_fused.get(underlying, False)
+            if stale_count > 0:
+                if not was_fused:
+                    logger.critical(
+                        "[ALERT] %s 期权数据流中断或 UI 未激活，已触发熔断保护！（%d/%d 核心合约 STALE）",
+                        underlying,
+                        stale_count,
+                        len(watched_codes),
+                    )
+                self._product_fused[underlying] = True
+            else:
+                if was_fused:
+                    logger.info("[RECOVERED] %s 数据流已恢复，解除熔断", underlying)
+                self._product_fused[underlying] = False
+
+    def _find_atm_contracts(self, codes: List[str], etf_price: float) -> List[str]:
+        if etf_price <= 0:
+            return []
+
+        out: List[str] = []
+        for code in codes:
+            entry = self._routes.get(code)
+            if not entry:
+                continue
+            strike_text = (entry.strike or "").strip().upper()
+            if not strike_text:
+                continue
+            try:
+                strike = float(strike_text.rstrip("A"))
+            except ValueError:
+                continue
+            if strike <= 0:
+                continue
+            if abs(strike - etf_price) / etf_price <= 0.05:
+                out.append(code)
+        return out
+
     def _poll_loop(self) -> None:
         try:
             self._client = DDEClientManager(logger=logger)
@@ -156,12 +299,18 @@ class DDESubscriber(DataProvider):
 
         while self._is_running:
             data = self._client.poll_data(self._routes)
+            self._update_staleness(data)
+            fused_snapshot = self._snapshot_fused_map()
+
             ts = bj_now_naive()
             ts_ms = int(ts.timestamp() * 1000)
 
             for raw_code, row in data.items():
                 entry = self._routes.get(raw_code)
                 if not entry:
+                    continue
+                key = self._underlying_key(entry, raw_code)
+                if key and fused_snapshot.get(key, False):
                     continue
                 if entry.option_type == "ETF":
                     self._emit_etf_tick(entry, row, ts, ts_ms)

@@ -44,6 +44,8 @@ td{padding:5px 8px;border-bottom:1px solid #eef2f7}
     <span class="kv">最后更新时间：<span id="ts">--</span></span>
     <span class="kv">路由数：<span id="routeCount">0</span></span>
     <span class="kv">有效最新价：<span id="validCount">0</span></span>
+    <span class="kv">STALE 合约：<span id="staleCount">0</span></span>
+    <span class="kv">熔断品种：<span id="fusedText">无</span></span>
     <span class="kv">数据模式：<span id="dataMode" style="color:#7c3aed">--</span></span>
     <span class="kv">合约信息更新于：<span id="ocMtime" style="color:#2563eb">--</span></span>
   </div>
@@ -63,9 +65,11 @@ td{padding:5px 8px;border-bottom:1px solid #eef2f7}
         <th>ASK1</th>
         <th>B1V</th>
         <th>A1V</th>
+        <th>健康</th>
+        <th>熔断</th>
       </tr>
     </thead>
-    <tbody id="tbody"><tr><td colspan="10" style="color:#94a3b8">等待启动 DDE...</td></tr></tbody>
+    <tbody id="tbody"><tr><td colspan="12" style="color:#94a3b8">等待启动 DDE...</td></tr></tbody>
   </table>
 </div>
 
@@ -144,9 +148,13 @@ async function pollNow(){
     $("ts").innerText = r.time || "--";
     $("routeCount").innerText = r.route_count || 0;
     $("validCount").innerText = r.valid_last_count || 0;
+    const health = r.health || {};
+    $("staleCount").innerText = health.stale_count || 0;
+    const fused = health.fused_underlyings || [];
+    $("fusedText").innerText = fused.length ? fused.join(", ") : "无";
     const rows = r.rows || [];
     if(rows.length === 0){
-      $("tbody").innerHTML = `<tr><td colspan="10" style="color:#94a3b8">没有返回数据</td></tr>`;
+      $("tbody").innerHTML = `<tr><td colspan="12" style="color:#94a3b8">没有返回数据</td></tr>`;
       return;
     }
     $("tbody").innerHTML = rows.map(x => `
@@ -161,10 +169,12 @@ async function pollNow(){
         <td>${fmtNum(x.ask1,4)}</td>
         <td>${fmtNum(x.bidv1,0)}</td>
         <td>${fmtNum(x.askv1,0)}</td>
+        <td class="${x.health === 'STALE' ? 'bad' : 'good'}">${fmt(x.health || "ACTIVE")}</td>
+        <td class="${x.fused ? 'bad' : 'good'}">${x.fused ? "ON" : "OFF"}</td>
       </tr>
     `).join("");
   }catch(e){
-    $("tbody").innerHTML = `<tr><td colspan="10" style="color:#94a3b8">${e.message}</td></tr>`;
+    $("tbody").innerHTML = `<tr><td colspan="12" style="color:#94a3b8">${e.message}</td></tr>`;
   }
 }
 

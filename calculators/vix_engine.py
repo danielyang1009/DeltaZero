@@ -11,9 +11,12 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from datetime import datetime, time
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 from models import ContractInfo
+
+if TYPE_CHECKING:
+    from calculators.yield_curve import BoundedCubicSplineRate
 
 
 MINUTES_PER_YEAR = 525_600.0
@@ -71,7 +74,7 @@ class VIXEngine:
 
     def __init__(
         self,
-        risk_free_rate: float,
+        risk_free_rate: Union[float, "BoundedCubicSplineRate"] = 0.02,
         *,
         minutes_per_year: float = MINUTES_PER_YEAR,
         expiry_clock: time = time(15, 0),
@@ -162,7 +165,7 @@ class VIXEngine:
             return None
 
         k_atm, c_atm, p_atm = atm_ref
-        rt = self.risk_free_rate * t
+        rt = self._get_rt(t)
         exp_rt = math.exp(rt)
 
         # 2) 远期价格 F 与 K0
@@ -255,6 +258,17 @@ class VIXEngine:
         if minutes <= 0:
             return None
         return minutes / self.minutes_per_year
+
+    def _get_rt(self, t_years: float) -> float:
+        """
+        返回 e^(rT) 中的 rT。
+        - 常数利率: rT = rate * T
+        - 曲线利率: r = curve.get_rate(T*365)，再乘 T
+        """
+        if hasattr(self.risk_free_rate, "get_rate"):
+            rate = float(self.risk_free_rate.get_rate(t_years * 365.0))
+            return rate * t_years
+        return float(self.risk_free_rate) * t_years
 
     @staticmethod
     def _pick_atm_reference(

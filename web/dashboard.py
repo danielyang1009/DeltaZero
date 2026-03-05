@@ -46,6 +46,14 @@ app = FastAPI(title="DeltaZero Web Console", version="0.3.0")
 _dde_lock = threading.Lock()
 _dde_feeder = None
 _dde_routes_cache: Dict[str, Any] = {"key": "", "routes": {}}
+_dde_health_cache: Dict[str, Any] = {
+    "prev_values": {},
+    "last_change_ts": {},
+    "contract_status": {},
+    "product_fused": {},
+    "etf_prices": {},
+    "timeout": 30.0,
+}
 
 _METADATA_DIR = Path(__file__).resolve().parent.parent / "metadata"
 _WIND_OPTIONCHAIN_PATH = _METADATA_DIR / "wind_50etf_optionchain.xlsx"
@@ -177,6 +185,97 @@ def _wxy_50etf_mtime_ago() -> str:
     if delta < 86400:
         return f"{int(delta // 3600)}小时前"
     return f"{int(delta // 86400)}天前"
+
+
+def _update_dde_health_from_rows(rows: list[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    依据当前轮询结果计算合约活跃度与品种熔断状态。
+    这里复用与 DDESubscriber 相同的核心字段变化规则，避免页面侧静态值误判。
+    """
+    now = time.time()
+    core_fields = ("last", "bid1", "ask1")
+    timeout = float(_dde_health_cache.get("timeout", 30.0) or 30.0)
+    prev_values: Dict[str, Dict[str, Any]] = _dde_health_cache["prev_values"]
+    last_change_ts: Dict[str, float] = _dde_health_cache["last_change_ts"]
+    contract_status: Dict[str, str] = _dde_health_cache["contract_status"]
+    product_fused: Dict[str, bool] = _dde_health_cache["product_fused"]
+    etf_prices: Dict[str, float] = _dde_health_cache["etf_prices"]
+
+    # 合约状态更新
+    for row in rows:
+        code = str(row.get("code", "") or "").strip()
+        if not code:
+            continue
+        cur = {k: row.get(k) for k in core_fields}
+        prev = prev_values.get(code, {})
+        changed = any(cur.get(k) != prev.get(k) for k in core_fields)
+        if code not in last_change_ts:
+            last_change_ts[code] = now
+            contract_status[code] = "ACTIVE"
+        elif changed:
+            last_change_ts[code] = now
+            contract_status[code] = "ACTIVE"
+        else:
+            elapsed = now - last_change_ts.get(code, now)
+            contract_status[code] = "STALE" if elapsed > timeout else "ACTIVE"
+        prev_values[code] = cur
+
+        row_type = str(row.get("type", "")).upper()
+        if row_type == "ETF":
+            underlying = str(row.get("underlying", "") or "").strip()
+            if not underlying:
+                underlying = code.replace(".SH", "").replace(".XSHG", "")
+            last = row.get("last")
+            if isinstance(last, (int, float)) and last > 0:
+                etf_prices[underlying] = float(last)
+
+    # 品种熔断：核心平值合约（若可识别）或退化为全量合约
+    groups: Dict[str, list[Dict[str, Any]]] = {}
+    for row in rows:
+        if str(row.get("type", "")).upper() == "ETF":
+            continue
+        underlying = str(row.get("underlying", "") or "").strip()
+        if underlying:
+            groups.setdefault(underlying, []).append(row)
+
+    for underlying, opts in groups.items():
+        etf_price = float(etf_prices.get(underlying, 0.0) or 0.0)
+        watched = []
+        if etf_price > 0:
+            for row in opts:
+                strike = row.get("strike")
+                try:
+                    if strike is None or str(strike).strip() == "":
+                        continue
+                    strike_v = float(str(strike).upper().rstrip("A"))
+                except ValueError:
+                    continue
+                if strike_v > 0 and abs(strike_v - etf_price) / etf_price <= 0.05:
+                    watched.append(row)
+        if not watched:
+            watched = opts
+
+        stale_count = 0
+        for row in watched:
+            code = str(row.get("code", "") or "").strip()
+            if contract_status.get(code) == "STALE":
+                stale_count += 1
+        product_fused[underlying] = stale_count > 0
+
+    for row in rows:
+        code = str(row.get("code", "") or "").strip()
+        underlying = str(row.get("underlying", "") or "").strip()
+        row["health"] = contract_status.get(code, "ACTIVE")
+        row["fused"] = bool(product_fused.get(underlying, False)) if underlying else False
+
+    fused_underlyings = sorted([k for k, v in product_fused.items() if v])
+    return {
+        "timeout": timeout,
+        "fused_underlyings": fused_underlyings,
+        "fused_count": len(fused_underlyings),
+        "stale_count": sum(1 for v in contract_status.values() if v == "STALE"),
+        "active_count": sum(1 for v in contract_status.values() if v == "ACTIVE"),
+    }
 
 
 class MonitorStartRequest(BaseModel):
@@ -355,6 +454,7 @@ def _poll_from_recorder_snapshot(wind_info: Dict[str, Dict[str, Any]]) -> Dict[s
         )
 
     rows.sort(key=lambda r: (r["underlying"], r["type"], r["code"]))
+    health = _update_dde_health_from_rows(rows)
     return {
         "ok": True,
         "time": bj_now_naive().strftime("%Y-%m-%d %H:%M:%S"),
@@ -362,6 +462,7 @@ def _poll_from_recorder_snapshot(wind_info: Dict[str, Dict[str, Any]]) -> Dict[s
         "rows": rows,
         "valid_last_count": valid_last,
         "mode": "databus",
+        "health": health,
     }
 
 
@@ -438,6 +539,13 @@ def dde_poll() -> Dict[str, Any]:
             "route_count": 0,
             "rows": [],
             "valid_last_count": 0,
+            "health": {
+                "timeout": float(_dde_health_cache.get("timeout", 30.0) or 30.0),
+                "fused_underlyings": [],
+                "fused_count": 0,
+                "stale_count": 0,
+                "active_count": 0,
+            },
         }
 
     feeder = _dde_feeder
@@ -475,12 +583,14 @@ def dde_poll() -> Dict[str, Any]:
                     "askv1": quote.get("ASKVOLUME1"),
                 }
             )
+        health = _update_dde_health_from_rows(rows)
         return {
             "ok": True,
             "time": bj_now_naive().strftime("%Y-%m-%d %H:%M:%S"),
             "route_count": len(feeder.routes),
             "rows": rows,
             "valid_last_count": valid_last,
+            "health": health,
         }
 
 
