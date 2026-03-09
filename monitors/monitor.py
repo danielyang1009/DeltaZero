@@ -198,9 +198,7 @@ def _build_etf_table(
             f"[bold]{expiry.strftime('%Y-%m-%d')}[/bold]"
             f"  [dim]自然日 {cal_days}天  交易日 {trade_days}天  ×{mult}[/dim]"
         )
-        renderables.append(Text(""))                              # 标题前留空行
         renderables.append(Rule(rule_title, style="cyan"))        # 居中（默认 align="center"）
-        renderables.append(Text(""))                              # 标题后留空行
 
         data_tbl = _make_table(show_header=False)
         for sig in sorted(group, key=lambda s: s.strike):
