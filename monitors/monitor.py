@@ -31,6 +31,7 @@ from rich.live import Live
 from rich.panel import Panel
 from rich.rule import Rule
 from rich.table import Table
+from rich.text import Text
 
 from utils.time_utils import bj_today
 from monitors.common import (
@@ -142,7 +143,7 @@ def _build_etf_table(
         tbl.add_column("C_b",    width=7,  justify="right")
         tbl.add_column("P_a",    width=7,  justify="right")
         tbl.add_column("S",      width=7,  justify="right")
-        tbl.add_column("乘数",   width=6,  justify="right")
+        # 乘数列已移至每组 Rule 标题，此处不再单独列出
         return tbl
 
     def _add_sig_row(tbl: Table, sig: TradeSignal) -> None:
@@ -168,46 +169,43 @@ def _build_etf_table(
             f"{sig.call_bid:.4f}",
             f"{sig.put_ask:.4f}",
             f"{sig.spot_price:.4f}",
-            str(sig.multiplier),
         )
 
     if not sigs:
         tbl = _make_table(show_header=True)
-        tbl.add_row(*["—"] * 14)
+        tbl.add_row(*["—"] * 13)
         return Panel(tbl, title=panel_title, subtitle=panel_subtitle,
                      border_style=border, expand=True, padding=(0, 1))
 
     today = bj_today()
-    by_expiry: Dict[date, List[TradeSignal]] = defaultdict(list)
+
+    # 按 (到期日, 乘数) 分组——同一到期日的标准合约与调整型合约各为独立组
+    by_expiry_mult: Dict[Tuple[date, int], List[TradeSignal]] = defaultdict(list)
     for sig in sigs:
-        by_expiry[sig.expiry].append(sig)
+        by_expiry_mult[(sig.expiry, sig.multiplier)].append(sig)
 
     renderables: List = []
-    for i, expiry in enumerate(sorted(by_expiry)):
-        group = by_expiry[expiry]
-        normal = sorted([s for s in group if not s.is_adjusted], key=lambda s: s.strike)
-        adjusted = sorted([s for s in group if s.is_adjusted], key=lambda s: s.strike)
 
+    # 全局共用列名，置于面板最顶部，仅显示一次
+    renderables.append(_make_table(show_header=True))
+
+    for (expiry, mult), group in sorted(by_expiry_mult.items()):
         cal_days = (expiry - today).days
         trade_days = _trading_days_until(expiry, today)
-        mult_rep = group[0].multiplier
 
-        # 全宽横幅标题（Rule 组件天然跨满所有列）
+        # 居中 Rule 标题，含到期日、自然日、交易日、乘数
         rule_title = (
             f"[bold]{expiry.strftime('%Y-%m-%d')}[/bold]"
-            f"  [dim]自然日 {cal_days}天  交易日 {trade_days}天  ×{mult_rep}[/dim]"
+            f"  [dim]自然日 {cal_days}天  交易日 {trade_days}天  ×{mult}[/dim]"
         )
-        renderables.append(Rule(rule_title, style="cyan", align="left"))
+        renderables.append(Text(""))                              # 标题前留空行
+        renderables.append(Rule(rule_title, style="cyan"))        # 居中（默认 align="center"）
+        renderables.append(Text(""))                              # 标题后留空行
 
-        # 第一个到期组显示列名，后续组省略（列名对所有组通用）
-        tbl = _make_table(show_header=(i == 0))
-        for sig in normal:
-            _add_sig_row(tbl, sig)
-        if adjusted and normal:
-            tbl.add_section()
-        for sig in adjusted:
-            _add_sig_row(tbl, sig)
-        renderables.append(tbl)
+        data_tbl = _make_table(show_header=False)
+        for sig in sorted(group, key=lambda s: s.strike):
+            _add_sig_row(data_tbl, sig)
+        renderables.append(data_tbl)
 
     return Panel(
         RenderGroup(*renderables),
