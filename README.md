@@ -77,14 +77,14 @@ python -m monitors.monitor --zmq-port 5555
 from datetime import date
 from calculators.yield_curve import BoundedCubicSplineRate
 
-# 使用“今天”曲线，文件不存在会直接报错
+# 使用”今天”曲线；当日文件不存在时自动回退至 7 日内最新文件
 curve_today = BoundedCubicSplineRate.from_cgb_daily()
 
 # 显式指定某一天的曲线
 curve_20260305 = BoundedCubicSplineRate.from_cgb_daily(target_date=date(2026, 3, 5))
 ```
 
-> `from_cgb_daily` 会校验文件内 `date` 列与指定日期一致；不一致或缺失时抛出异常，避免用错曲线。
+> `from_cgb_daily` 优先加载当日文件；若不存在，自动回退至 7 个自然日内最新文件（回退时发出 Warning）；7 日内均无文件则抛 `FileNotFoundError`。
 
 ## 交易参数（Monitor 净利润计算）
 
