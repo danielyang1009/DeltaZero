@@ -47,7 +47,10 @@ td{padding:5px 8px;border-bottom:1px solid #eef2f7}
     <span class="kv">STALE 合约：<span id="staleCount">0</span></span>
     <span class="kv">熔断品种：<span id="fusedText">无</span></span>
     <span class="kv">数据模式：<span id="dataMode" style="color:#7c3aed">--</span></span>
-    <span class="kv">合约信息更新于：<span id="ocMtime" style="color:#2563eb">--</span></span>
+    <span class="kv">wind_sse_optionchain：<span id="ocMtime" style="color:#2563eb">--</span></span>
+    <span class="kv">wxy_50etf：<span id="wxy50Mtime" style="color:#2563eb">--</span></span>
+    <span class="kv">wxy_300etf：<span id="wxy300Mtime" style="color:#2563eb">--</span></span>
+    <span class="kv">wxy_500etf：<span id="wxy500Mtime" style="color:#2563eb">--</span></span>
   </div>
 </div>
 
@@ -110,6 +113,9 @@ async function refreshState(){
     setRunning(st.running);
     $("routeCount").innerText = st.route_count || 0;
     $("ocMtime").innerText = st.optionchain_mtime || "未找到";
+    $("wxy50Mtime").innerText = st.wxy_50etf_mtime || "未找到";
+    $("wxy300Mtime").innerText = st.wxy_300etf_mtime || "未找到";
+    $("wxy500Mtime").innerText = st.wxy_500etf_mtime || "未找到";
     const modeText = st.data_mode === "databus"
       ? `databus(${st.recorder_source || "unknown"})`
       : "direct_dde";

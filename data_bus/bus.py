@@ -64,7 +64,7 @@ def _in_trading_hours(now: datetime) -> bool:
 # 主循环
 # ──────────────────────────────────────────────────────────────────────
 
-def run(config: RecorderConfig, source: str = "wind", persist: bool = True) -> None:
+def run(config: RecorderConfig, source: str = "wind", persist: bool = True, dde_mode: str = "advise") -> None:
     """数据记录主循环"""
 
     logger.info("=" * 60)
@@ -89,6 +89,7 @@ def run(config: RecorderConfig, source: str = "wind", persist: bool = True) -> N
             products=config.products,
             tick_queue=tick_queue,
             poll_interval=max(1.0, config.flush_interval_secs / 10),
+            mode=dde_mode,
         )
     else:
         subscriber = WindSubscriber(
@@ -299,6 +300,8 @@ def _parse_args() -> argparse.Namespace:
                         help="wsq 每批代码数（默认: 80）")
     parser.add_argument("--source", choices=["wind", "dde"], default="wind",
                         help="数据源类型（默认: wind）")
+    parser.add_argument("--mode", choices=["advise", "request"], default="advise",
+                        help="DDE 模式: advise=热链接推送, request=轮询（默认: advise）")
     parser.add_argument("--no-persist", action="store_true",
                         help="仅做总线广播，不写 Parquet 磁盘文件")
     parser.add_argument("--new-window", action="store_true",
@@ -336,7 +339,7 @@ def main() -> None:
         config.batch_size = args.batch
 
     config.persist = not args.no_persist
-    run(config, source=args.source, persist=config.persist)
+    run(config, source=args.source, persist=config.persist, dde_mode=args.mode)
 
 
 if __name__ == "__main__":

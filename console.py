@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import logging
 import sys
 import threading
 import time
@@ -77,6 +78,13 @@ def _bootstrap_processes(args: argparse.Namespace) -> None:
 
 
 if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%H:%M:%S",
+        stream=sys.stdout,
+    )
+
     args = _parse_args()
 
     _bootstrap_processes(args)

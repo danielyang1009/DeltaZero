@@ -15,7 +15,7 @@ import argparse
 import sys
 import time
 from collections import defaultdict
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -29,8 +29,11 @@ from rich import box
 from rich.console import Console, Group as RenderGroup
 from rich.live import Live
 from rich.panel import Panel
+from rich.rule import Rule
 from rich.table import Table
+from rich.text import Text
 
+from utils.time_utils import bj_today
 from monitors.common import (
     ETF_NAME_MAP,
     ETF_ORDER,
@@ -65,6 +68,38 @@ logging.basicConfig(
 # Rich 显示构建
 # ──────────────────────────────────────────────────────────────────────
 
+_TRADE_DATE_SET: Optional[set] = None
+
+
+def _get_trade_date_set() -> set:
+    """懒加载 A 股交易日历（akshare），失败时回退到纯工作日计算。"""
+    global _TRADE_DATE_SET
+    if _TRADE_DATE_SET is None:
+        try:
+            import akshare as ak
+            cal = ak.tool_trade_date_hist_sina()
+            _TRADE_DATE_SET = set(cal["trade_date"].tolist())  # datetime.date 对象
+        except Exception:
+            _TRADE_DATE_SET = set()  # 空集触发回退
+    return _TRADE_DATE_SET
+
+
+def _trading_days_until(expiry: date, today: date) -> int:
+    """从 today 到 expiry（含）的 A 股交易日数；无法获取日历时回退到工作日数。"""
+    trade_set = _get_trade_date_set()
+    count = 0
+    d = today
+    while d <= expiry:
+        if trade_set:
+            if d in trade_set:
+                count += 1
+        else:
+            if d.weekday() < 5:
+                count += 1
+        d += timedelta(days=1)
+    return count
+
+
 _ETF_BORDER = {
     "510050.SH": "bright_cyan",
     "510300.SH": "bright_blue",
@@ -85,137 +120,123 @@ def _build_etf_table(
     n_opts: int = 0,
     n_positive: int = 0,
     n_profitable: int = 0,
-) -> Table:
-    """为单个品种构建信号表格（固定显示 ATM 上下各 n_each_side 行）"""
+) -> Panel:
+    """为单个品种构建信号面板，每个到期日组显示跨列全宽横幅标题。"""
     u_name = ETF_NAME_MAP.get(underlying.split(".")[0], underlying)
     n_profitable_val = sum(1 for s in sigs if s.net_profit_estimate >= min_profit)
     border = "bright_green" if n_profitable_val > 0 else (_ETF_BORDER.get(underlying, "dim") if sigs else "dim")
 
-    # 第一行：品种名、价格、VIX
-    line1 = [f"[bold]{u_name}[/bold]"]
+    # 面板标题：品种名、价格、VIX
+    title_parts = [f"[bold]{u_name}[/bold]"]
     if price > 0:
-        line1.append(f"[yellow]{price:.4f}[/yellow]")
+        title_parts.append(f"[yellow]{price:.4f}[/yellow]")
     if vix_value is not None:
-        line1.append(f"[magenta]VIX {vix_value:.2f}[/magenta]")
+        title_parts.append(f"[magenta]VIX {vix_value:.2f}[/magenta]")
     if not sigs:
-        line1.append("[dim]暂无数据[/dim]")
+        title_parts.append("[dim]暂无数据[/dim]")
+    panel_title = "  ".join(title_parts)
 
-    # 第二行：监控配对、订阅期权、有效报价、正向机会(≥0)、高价值(≥min_profit)
-    line2 = (
+    # 面板副标题：统计信息（显示在面板底部边框）
+    panel_subtitle = (
         f"[dim]监控配对: {n_pairs} 组  订阅期权: {n_opts} 个  "
         f"有报价: {len(sigs)} 条  正向机会: {n_positive}  (≥{min_profit:.0f}元: {n_profitable})[/dim]"
     )
 
-    tbl = Table(
-        title="  ".join(line1) + "\n" + line2,
-        box=box.SIMPLE_HEAVY,
-        show_header=True,
-        header_style="bold cyan",
-        border_style=border,
-        expand=True,
-        padding=(0, 1),
-    )
-    tbl.add_column("到期",   style="dim", width=5,  justify="center")
-    tbl.add_column("行权价",             width=6,  justify="left")
-    tbl.add_column("方向",               width=4,  justify="center")
-    tbl.add_column("净利润",             width=7,  justify="right")
-    tbl.add_column("Max_Qty",           width=6,  justify="right")
-    tbl.add_column("SPRD",              width=5,  justify="right")
-    tbl.add_column("OBI_C",             width=5,  justify="right")
-    tbl.add_column("OBI_S",             width=5,  justify="right")
-    tbl.add_column("OBI_P",             width=5,  justify="right")
-    tbl.add_column("Net_1T",           width=7,  justify="right")
-    tbl.add_column("TOL",              width=6,  justify="right")
-    tbl.add_column("C_b",               width=7,  justify="right")
-    tbl.add_column("P_a",               width=7,  justify="right")
-    tbl.add_column("S",                 width=7,  justify="right")
-    tbl.add_column("乘数",               width=6,  justify="right")
-
-    if not sigs:
-        tbl.add_row(*["—"] * 15)
+    def _make_table(show_header: bool) -> Table:
+        tbl = Table(
+            box=box.SIMPLE,
+            show_header=show_header,
+            header_style="bold cyan",
+            show_edge=False,
+            expand=True,
+            padding=(0, 0),
+        )
+        tbl.add_column("行权价", width=6,  justify="left")
+        tbl.add_column("方向",   width=4,  justify="center")
+        tbl.add_column("净利润", width=7,  justify="right")
+        tbl.add_column("Net_1T", width=7,  justify="right")
+        tbl.add_column("TOL",    width=5,  justify="right")
+        tbl.add_column("Max_Qty", width=5, justify="right")
+        tbl.add_column("SPRD",   width=5,  justify="right")
+        tbl.add_column("OBI_C",  width=4,  justify="right")
+        tbl.add_column("OBI_P",  width=4,  justify="right")
+        tbl.add_column("OBI_S",  width=4,  justify="right")
+        tbl.add_column("C_b",    width=6,  justify="right")
+        tbl.add_column("P_a",    width=6,  justify="right")
+        tbl.add_column("S_a",    width=6,  justify="right")
+        # 乘数列已移至每组 Rule 标题，此处不再单独列出
         return tbl
 
-    def _add_sig_row(sig: TradeSignal) -> None:
+    def _add_sig_row(tbl: Table, sig: TradeSignal) -> None:
         profit = sig.net_profit_estimate
-        is_adj = sig.is_adjusted
-
         if profit >= min_profit:
             profit_str = f"[bold green]{profit:.0f}[/bold green]"
             dir_str = "[bold green]正向[/bold green]"
         elif profit >= 0:
-            profit_str = f"{profit:.0f}"
-            dir_str = "正向"
+            profit_str = f"[white]{profit:.0f}[/white]"
+            dir_str = "[white]正向[/white]"
         else:
             profit_str = f"[dim]{profit:.0f}[/dim]"
             dir_str = ""
-
-        mult_str = str(sig.multiplier)
-        max_qty_str = f"{sig.max_qty:.2f}" if sig.max_qty is not None else "--"
-        spread_str = f"{sig.spread_ratio * 100:.1f}%" if sig.spread_ratio is not None else "--"
-        obi_c_str = f"{sig.obi_c:.2f}" if sig.obi_c is not None else "--"
-        obi_s_str = f"{sig.obi_s:.2f}" if sig.obi_s is not None else "--"
-        obi_p_str = f"{sig.obi_p:.2f}" if sig.obi_p is not None else "--"
-        net_1tick_str = f"{sig.net_1tick:.0f}" if sig.net_1tick is not None else "--"
-        tolerance_str = f"{sig.tolerance:.2f}" if sig.tolerance is not None else "--"
-
-        risk_gray = (
-            (sig.max_qty is not None and sig.max_qty < 5)
-            or (sig.spread_ratio is not None and sig.spread_ratio > 0.10)
-            or (sig.tolerance is not None and sig.tolerance < 3.0)
-            or (sig.obi_c is not None and sig.obi_c < 0.2)
-            or (sig.obi_s is not None and sig.obi_s < 0.2)
-            or (sig.obi_p is not None and sig.obi_p < 0.2)
-        )
-        risk_red = (
-            (sig.spread_ratio is not None and sig.spread_ratio > 0.10)
-            or (sig.tolerance is not None and sig.tolerance < 1.0)
-        )
-        row_style = "black on bright_red" if risk_red else ("dim" if risk_gray else None)
-
-        adj_tag = " [dim]A[/dim]" if is_adj else ""
-        strike_str = f"{sig.strike:.2f}{adj_tag}"
-
+        adj_tag = " [dim]A[/dim]" if sig.is_adjusted else ""
         tbl.add_row(
-            sig.expiry.strftime("%m-%d"),
-            strike_str,
+            f"{sig.strike:.2f}{adj_tag}",
             dir_str,
             profit_str,
-            max_qty_str,
-            spread_str,
-            obi_c_str,
-            obi_s_str,
-            obi_p_str,
-            net_1tick_str,
-            tolerance_str,
+            f"{sig.net_1tick:.0f}" if sig.net_1tick is not None else "--",
+            f"{sig.tolerance:.2f}" if sig.tolerance is not None else "--",
+            f"{sig.max_qty:.2f}" if sig.max_qty is not None else "--",
+            f"{sig.spread_ratio * 100:.1f}%" if sig.spread_ratio is not None else "--",
+            f"{sig.obi_c:.2f}" if sig.obi_c is not None else "--",
+            f"{sig.obi_p:.2f}" if sig.obi_p is not None else "--",
+            f"{sig.obi_s:.2f}" if sig.obi_s is not None else "--",
             f"{sig.call_bid:.4f}",
             f"{sig.put_ask:.4f}",
             f"{sig.spot_price:.4f}",
-            mult_str,
-            style=row_style,
         )
 
-    by_expiry: Dict[date, List[TradeSignal]] = defaultdict(list)
+    if not sigs:
+        tbl = _make_table(show_header=True)
+        tbl.add_row(*["—"] * 13)
+        return Panel(tbl, title=panel_title, subtitle=panel_subtitle,
+                     border_style=border, expand=True, padding=(0, 0))
+
+    today = bj_today()
+
+    # 按 (到期日, 乘数) 分组——同一到期日的标准合约与调整型合约各为独立组
+    by_expiry_mult: Dict[Tuple[date, int], List[TradeSignal]] = defaultdict(list)
     for sig in sigs:
-        by_expiry[sig.expiry].append(sig)
+        by_expiry_mult[(sig.expiry, sig.multiplier)].append(sig)
 
-    first_group = True
-    for expiry in sorted(by_expiry):
-        group = by_expiry[expiry]
-        normal = sorted([s for s in group if not s.is_adjusted], key=lambda s: s.strike)
-        adjusted = sorted([s for s in group if s.is_adjusted], key=lambda s: s.strike)
+    renderables: List = []
 
-        if not first_group:
-            tbl.add_section()
-        first_group = False
+    # 全局共用列名，置于面板最顶部，仅显示一次
+    renderables.append(_make_table(show_header=True))
 
-        for sig in normal:
-            _add_sig_row(sig)
-        if adjusted and normal:
-            tbl.add_section()
-        for sig in adjusted:
-            _add_sig_row(sig)
+    for (expiry, mult), group in sorted(by_expiry_mult.items()):
+        cal_days = (expiry - today).days + 1  # 含今天和到期日两端
+        trade_days = _trading_days_until(expiry, today)
 
-    return tbl
+        # 居中 Rule 标题，含到期日、自然日、交易日、乘数
+        rule_title = (
+            f"[bold]{expiry.strftime('%Y-%m-%d')}[/bold]"
+            f"  [dim]自然日 {cal_days}天  交易日 {trade_days}天  ×{mult}[/dim]"
+        )
+        renderables.append(Rule(rule_title, style="cyan"))        # 居中（默认 align="center"）
+
+        data_tbl = _make_table(show_header=False)
+        for sig in sorted(group, key=lambda s: s.strike):
+            _add_sig_row(data_tbl, sig)
+        renderables.append(data_tbl)
+
+    return Panel(
+        RenderGroup(*renderables),
+        title=panel_title,
+        subtitle=panel_subtitle,
+        border_style=border,
+        expand=True,
+        padding=(0, 0),
+    )
 
 
 def build_display(
@@ -234,7 +255,7 @@ def build_display(
         f"[bold bright_green]⚡ DeltaZero 正向套利监控[/bold bright_green]  "
         f"[dim]{ts.strftime('%H:%M:%S')}[/dim]  第 {iteration} 次刷新",
         box=box.MINIMAL,
-        padding=(0, 2),
+        padding=(0, 1),
     )
 
     # 按品种分组，再各自按 ATM 上下各取 n_each_side
@@ -278,6 +299,8 @@ def run_monitor(
     n_each_side: int = 10,
     zmq_port: int = 5555,
     snapshot_dir: str = DEFAULT_MARKET_DATA_DIR,
+    etf_fee_rate: float = 0.0002,
+    option_one_side_fee: float = 1.5,
 ) -> None:
     """ZMQ 订阅模式监控：从 data_bus 进程接收实时行情。"""
     try:
@@ -293,6 +316,8 @@ def run_monitor(
     from config.settings import get_default_config
     tmp_config = get_default_config()
     tmp_config.min_profit_threshold = min_profit
+    tmp_config.etf_fee_rate = etf_fee_rate
+    tmp_config.option_round_trip_fee = option_one_side_fee * 2
     tmp_strategy = PCPArbitrage(tmp_config)
     n_snap = restore_from_snapshot(tmp_strategy, snapshot_dir, etf_prices)
     if n_snap:
@@ -304,6 +329,8 @@ def run_monitor(
         strategy, contract_mgr, active, pairs, option_codes, etf_codes = (
             init_strategy_and_contracts(
                 min_profit, expiry_days, 1.0, etf_prices,  # 1.0=全量配对，显示由 n_each_side 控制
+                etf_fee_rate=etf_fee_rate,
+                option_round_trip_fee=option_one_side_fee * 2,
                 log_fn=lambda msg: console.print(msg),
             )
         )
@@ -324,7 +351,11 @@ def run_monitor(
     console.print(
         f"\n[bold green]ZMQ 模式监控已启动[/bold green]  "
         f"连接 tcp://127.0.0.1:{zmq_port}  "
-        f"收到新数据即刷新（空闲时每 {refresh_secs}s）  最小利润 {min_profit:.0f} 元  按 Ctrl+C 退出\n"
+        f"收到新数据即刷新（空闲时每 {refresh_secs}s）  最小利润 {min_profit:.0f} 元  按 Ctrl+C 退出"
+    )
+    console.print(
+        f"[dim]手续费：ETF {etf_fee_rate*10000:.1f}‱  期权单边 {option_one_side_fee:.2f} 元/张"
+        f"（双边 {option_one_side_fee*2:.2f} 元）[/dim]\n"
     )
 
     iteration = 0
@@ -462,6 +493,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--n-each-side", type=int, default=10, help="ATM 上下各显示 N 组（0=显示全部）")
     parser.add_argument("--zmq-port", type=int, default=5555, help="ZMQ PUB 端口")
     parser.add_argument("--snapshot-dir", type=str, default=DEFAULT_MARKET_DATA_DIR, help="快照文件目录")
+    parser.add_argument("--etf-fee-rate", type=float, default=0.0002, help="ETF 单边手续费率（默认 0.0002 即万2）")
+    parser.add_argument("--option-one-side-fee", type=float, default=1.5, help="期权单边手续费（元/张，默认 1.5）")
     return parser.parse_args()
 
 
@@ -474,4 +507,6 @@ if __name__ == "__main__":
         n_each_side=args.n_each_side,
         zmq_port=args.zmq_port,
         snapshot_dir=args.snapshot_dir,
+        etf_fee_rate=args.etf_fee_rate,
+        option_one_side_fee=args.option_one_side_fee,
     )

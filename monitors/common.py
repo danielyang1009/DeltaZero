@@ -403,6 +403,8 @@ def init_strategy_and_contracts(
     atm_range_pct: float,
     etf_prices: Dict[str, float],
     *,
+    etf_fee_rate: float = 0.0002,
+    option_round_trip_fee: float = 3.0,
     log_fn=None,
 ) -> Tuple[
     PCPArbitrage,
@@ -426,6 +428,8 @@ def init_strategy_and_contracts(
 
     config = get_default_config()
     config.min_profit_threshold = min_profit
+    config.etf_fee_rate = etf_fee_rate
+    config.option_round_trip_fee = option_round_trip_fee
     strategy = PCPArbitrage(config)
 
     contract_mgr = ContractInfoManager()

@@ -56,7 +56,7 @@ _dde_health_cache: Dict[str, Any] = {
 }
 
 _METADATA_DIR = Path(__file__).resolve().parent.parent / "metadata"
-_WIND_OPTIONCHAIN_PATH = _METADATA_DIR / "wind_50etf_optionchain.xlsx"
+_WIND_OPTIONCHAIN_PATH = _METADATA_DIR / "wind_sse_optionchain.xlsx"
 _wind_optionchain_cache: Dict[str, Any] = {}
 
 
@@ -155,7 +155,7 @@ def _load_wind_optionchain() -> Dict[str, Dict[str, Any]]:
 
 
 def _wind_optionchain_mtime_ago() -> str:
-    """返回 wind_50etf_optionchain.xlsx 距今多久未更新的描述文字。"""
+    """返回 wind_sse_optionchain.xlsx 距今多久未更新的描述文字。"""
     if not _WIND_OPTIONCHAIN_PATH.exists():
         return "文件不存在"
     mtime = _WIND_OPTIONCHAIN_PATH.stat().st_mtime
@@ -169,15 +169,10 @@ def _wind_optionchain_mtime_ago() -> str:
     return f"{int(delta // 86400)}天前"
 
 
-_WXY_50ETF_PATH = _METADATA_DIR / "wxy_50etf.xlsx"
-
-
-def _wxy_50etf_mtime_ago() -> str:
-    """返回 wxy_50etf.xlsx 距今多久未更新的描述文字。"""
-    if not _WXY_50ETF_PATH.exists():
-        return "文件不存在"
-    mtime = _WXY_50ETF_PATH.stat().st_mtime
-    delta = time.time() - mtime
+def _file_mtime_ago(path: Path) -> str:
+    if not path.exists():
+        return "未找到"
+    delta = time.time() - path.stat().st_mtime
     if delta < 60:
         return "刚刚"
     if delta < 3600:
@@ -185,6 +180,10 @@ def _wxy_50etf_mtime_ago() -> str:
     if delta < 86400:
         return f"{int(delta // 3600)}小时前"
     return f"{int(delta // 86400)}天前"
+
+
+def _wxy_50etf_mtime_ago() -> str:
+    return _file_mtime_ago(_METADATA_DIR / "wxy_50etf.xlsx")
 
 
 def _mtime_ago_str(mtime: float) -> str:
@@ -321,6 +320,8 @@ class MonitorStartRequest(BaseModel):
     n_each_side: int = 10
     zmq_port: int = 5555
     snapshot_dir: str = DEFAULT_MARKET_DATA_DIR
+    etf_fee_rate: float = 0.0002
+    option_one_side_fee: float = 1.5
 
 
 class DDEStartRequest(BaseModel):
@@ -557,6 +558,9 @@ def dde_state() -> Dict[str, Any]:
         "running": running,
         "route_count": route_count,
         "optionchain_mtime": _wind_optionchain_mtime_ago(),
+        "wxy_50etf_mtime": _file_mtime_ago(_METADATA_DIR / "wxy_50etf.xlsx"),
+        "wxy_300etf_mtime": _file_mtime_ago(_METADATA_DIR / "wxy_300etf.xlsx"),
+        "wxy_500etf_mtime": _file_mtime_ago(_METADATA_DIR / "wxy_500etf.xlsx"),
         "data_mode": "databus" if recorder_source else "direct_dde",
         "recorder_source": recorder_source,
     }
@@ -712,8 +716,10 @@ def get_state() -> Dict[str, Any]:
         "merge_status": merge_status,
         "market_data_dir": DEFAULT_MARKET_DATA_DIR,
         "metadata_files": {
-            "wind_50etf_optionchain": {"mtime_ago": _wind_optionchain_mtime_ago()},
-            "wxy_50etf": {"mtime_ago": _wxy_50etf_mtime_ago()},
+            "wind_sse_optionchain": {"mtime_ago": _wind_optionchain_mtime_ago()},
+            "wxy_50etf":  {"mtime_ago": _file_mtime_ago(_METADATA_DIR / "wxy_50etf.xlsx")},
+            "wxy_300etf": {"mtime_ago": _file_mtime_ago(_METADATA_DIR / "wxy_300etf.xlsx")},
+            "wxy_500etf": {"mtime_ago": _file_mtime_ago(_METADATA_DIR / "wxy_500etf.xlsx")},
         },
         "bond_files": _bond_files_info(),
     }
@@ -733,18 +739,14 @@ def start_recorder(req: RecorderStartRequest) -> Dict[str, Any]:
 @app.post("/api/processes/monitor/start")
 def start_monitor(req: MonitorStartRequest) -> Dict[str, Any]:
     args = [
-        "--min-profit",
-        str(req.min_profit),
-        "--expiry-days",
-        str(req.expiry_days),
-        "--refresh",
-        str(req.refresh),
-        "--n-each-side",
-        str(req.n_each_side),
-        "--zmq-port",
-        str(req.zmq_port),
-        "--snapshot-dir",
-        req.snapshot_dir,
+        "--min-profit", str(req.min_profit),
+        "--expiry-days", str(req.expiry_days),
+        "--refresh", str(req.refresh),
+        "--n-each-side", str(req.n_each_side),
+        "--zmq-port", str(req.zmq_port),
+        "--snapshot-dir", req.snapshot_dir,
+        "--etf-fee-rate", str(req.etf_fee_rate),
+        "--option-one-side-fee", str(req.option_one_side_fee),
     ]
     return {"ok": True, "started": spawn_module("monitors.monitor", args)}
 

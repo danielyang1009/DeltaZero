@@ -32,7 +32,7 @@ logger = logging.getLogger(__name__)
 
 _NS_MAIN = {"s": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
 _COL_RE = re.compile(r"([A-Z]+)")
-_WIND_CHAIN_GLOB = "metadata/wind_*_optionchain.xlsx"
+_WIND_CHAIN_GLOB = "metadata/wind_sse_optionchain.xlsx"
 
 _HEALTH_ACTIVE = "ACTIVE"
 _HEALTH_STALE = "STALE"
@@ -50,12 +50,14 @@ class DDESubscriber(DataProvider):
         products: List[str],
         tick_queue: Queue,
         poll_interval: float = 3.0,
-        staleness_timeout: float = 30.0,
+        staleness_timeout: float = 90.0,
+        mode: str = "advise",
     ) -> None:
         self._products = list(products)
         self._queue = tick_queue
         self._poll_interval = max(0.5, float(poll_interval))
         self._staleness_timeout = max(1.0, float(staleness_timeout))
+        self._mode = mode if mode in ("advise", "request") else "advise"
         self._is_running = False
         self._thread: Optional[threading.Thread] = None
 
@@ -119,7 +121,8 @@ class DDESubscriber(DataProvider):
                     self._product_fused.setdefault(key, False)
 
         self._is_running = True
-        self._thread = threading.Thread(target=self._poll_loop, name="dde-subscriber", daemon=True)
+        target = self._advise_loop if self._mode == "advise" else self._poll_loop
+        self._thread = threading.Thread(target=target, name="dde-subscriber", daemon=True)
         self._thread.start()
         # 等待轮询线程完成 DDE 初始化（DDE 连接需与请求在同线程）
         self._startup_done.wait(timeout=10.0)
@@ -135,7 +138,8 @@ class DDESubscriber(DataProvider):
             return False
 
         logger.info(
-            "DDE 订阅启动成功: %d 路由（连接 %d/%d），期权 %d，ETF %d",
+            "DDE 订阅启动成功 [%s]: %d 路由（连接 %d/%d），期权 %d，ETF %d",
+            self._mode.upper(),
             len(self._routes),
             getattr(self, "_connected_ok", 0),
             getattr(self, "_connected_total", 0),
@@ -316,6 +320,94 @@ class DDESubscriber(DataProvider):
 
             time.sleep(self._poll_interval)
 
+    def _advise_loop(self) -> None:
+        """ADVISE 热链接模式：由交易软件推送驱动，无固定轮询间隔。"""
+        # --- DDE 初始化（与 _poll_loop 相同）---
+        try:
+            self._client = DDEClientManager(logger=logger)
+            if not self._client.initialized:
+                self._startup_error = "DDE 客户端初始化失败"
+                self._startup_ok = False
+                self._startup_done.set()
+                return
+            ok, total = self._client.connect_routes(self._routes)
+            self._connected_ok = ok
+            self._connected_total = total
+            if ok <= 0:
+                self._startup_error = f"DDE 连接失败: {ok}/{total}"
+                self._startup_ok = False
+                self._startup_done.set()
+                return
+        except Exception as exc:
+            self._startup_error = str(exc)
+            self._startup_ok = False
+            self._startup_done.set()
+            return
+
+        # --- 注册 ADVISE 热链接 ---
+        adv_ok, adv_total = self._client.advise_start_all(self._routes)
+        if adv_ok <= 0:
+            logger.warning(
+                "ADVISE 注册全部失败 (%d/%d)，回退到 REQUEST 轮询模式",
+                adv_ok, adv_total,
+            )
+            self._mode = "request"
+            self._startup_ok = True
+            self._startup_done.set()
+            # 回退到 poll 循环
+            while self._is_running:
+                data = self._client.poll_data(self._routes)
+                self._update_staleness(data)
+                ts = bj_now_naive()
+                ts_ms = int(ts.timestamp() * 1000)
+                for raw_code, row in data.items():
+                    entry = self._routes.get(raw_code)
+                    if not entry:
+                        continue
+                    if entry.option_type == "ETF":
+                        self._emit_etf_tick(entry, row, ts, ts_ms)
+                    else:
+                        self._emit_option_tick(raw_code, entry, row, ts, ts_ms)
+                time.sleep(self._poll_interval)
+            return
+
+        logger.info("ADVISE 模式就绪: %d/%d 热链接注册成功", adv_ok, adv_total)
+        self._startup_ok = True
+        self._startup_done.set()
+
+        # --- 事件驱动主循环 ---
+        last_staleness_check = time.time()
+        while self._is_running:
+            dirty = self._client.pump_and_collect()
+
+            if dirty:
+                ts = bj_now_naive()
+                ts_ms = int(ts.timestamp() * 1000)
+                for topic, fields in dirty.items():
+                    codes = self._client._topic_to_codes.get(topic, [])
+                    for raw_code in codes:
+                        entry = self._routes.get(raw_code)
+                        if not entry:
+                            continue
+                        if entry.option_type == "ETF":
+                            self._emit_etf_tick(entry, fields, ts, ts_ms)
+                        else:
+                            self._emit_option_tick(raw_code, entry, fields, ts, ts_ms)
+
+            # 定期 staleness 检查（每秒一次）
+            now = time.time()
+            if now - last_staleness_check >= 1.0:
+                full = self._client.get_full_snapshot()
+                # 将 topic-keyed 快照转为 code-keyed 格式（与 _update_staleness 兼容）
+                code_data: Dict[str, Dict[str, Optional[float]]] = {}
+                for topic, snapshot in full.items():
+                    for raw_code in self._client._topic_to_codes.get(topic, []):
+                        code_data[raw_code] = snapshot
+                self._update_staleness(code_data)
+                last_staleness_check = now
+
+            time.sleep(0.005)  # 5ms，避免 CPU 空转
+
     def _emit_option_tick(
         self,
         raw_code: str,
@@ -447,7 +539,7 @@ class DDESubscriber(DataProvider):
             self._code_multiplier.setdefault(norm_code, 10000)
 
     def _load_optionchain_info(self) -> None:
-        """从 wind_*_optionchain.xlsx 补充 is_adjusted/multiplier。"""
+        """从 wind_sse_optionchain.xlsx 补充 is_adjusted/multiplier。"""
         files = sorted(glob.glob(_WIND_CHAIN_GLOB))
         if not files:
             return

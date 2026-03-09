@@ -28,8 +28,8 @@ _ADJUSTED_TAIL_RE = re.compile(r"[A-Z]$")
 
 def get_optionchain_path(target_date: date | None = None, metadata_dir: Path | None = None) -> Path:
     """
-    获取 optionchain CSV 路径。
-    若指定日期文件不存在，则返回 metadata 下最新一份。
+    获取 optionchain 文件路径（CSV 或 xlsx）。
+    优先级：当日 CSV > 最新 CSV > metadata 下任意 xlsx > 当日 CSV 占位路径（不存在）。
     """
     base = metadata_dir or (Path(__file__).resolve().parent.parent / "metadata")
     if target_date is None:
@@ -37,8 +37,16 @@ def get_optionchain_path(target_date: date | None = None, metadata_dir: Path | N
     p = base / f"{target_date:%Y-%m-%d}_optionchain.csv"
     if p.exists():
         return p
-    candidates = sorted(base.glob("*_optionchain.csv"), reverse=True)
-    return candidates[0] if candidates else p
+    csv_candidates = sorted(base.glob("*_optionchain.csv"), reverse=True)
+    if csv_candidates:
+        return csv_candidates[0]
+    # 优先找名字含 optionchain 的 xlsx，再退而求其次找任意 xlsx
+    xlsx_candidates = sorted(base.glob("*optionchain*.xlsx"), reverse=True)
+    if not xlsx_candidates:
+        xlsx_candidates = sorted(base.glob("*.xlsx"), reverse=True)
+    if xlsx_candidates:
+        return xlsx_candidates[0]
+    return p
 
 
 class ContractInfoManager:
@@ -56,6 +64,19 @@ class ContractInfoManager:
         self.contracts: Dict[str, ContractInfo] = {}
         self._pairs_cache: Dict[str, List[Tuple[ContractInfo, ContractInfo]]] = {}
 
+    # Wind xlsx 按列位置到标准字段名的映射（顺序固定）
+    _XLSX_COL_NAMES = [
+        "option_code",      # 0 证券代码
+        "option_name",      # 1 证券简称
+        "us_code",          # 2 标的Wind代码
+        "call_put",         # 3 期权类型（认购/认沽）
+        "strike_price",     # 4 行权价格
+        "first_tradedate",  # 5 起始交易日期
+        "last_tradedate",   # 6 最后交易日期
+        "month",            # 7 交割月份
+        "multiplier",       # 8 合约乘数
+    ]
+
     def load_from_optionchain(
         self,
         csv_path: str | Path,
@@ -63,13 +84,15 @@ class ContractInfoManager:
         max_age_days: int = 7,
     ) -> int:
         """
-        从 optionchain CSV（fetch_optionchain 产出）加载合约信息，含乘数。
+        从 optionchain 文件加载合约信息，含乘数。支持 CSV 和 Wind 导出的 xlsx。
 
         CSV 需含：option_code, option_name, us_code, strike_price, month, call_put,
         first_tradedate, last_tradedate, multiplier。
 
+        xlsx 按列位置解析（Wind 导出格式，列名中文，无需列名匹配）。
+
         Args:
-            csv_path: metadata/YYYY-MM-DD_optionchain.csv 路径
+            csv_path: 文件路径（.csv 或 .xlsx）
             target_date: 目标日期，用于校验文件是否过期（不传则用今日）
             max_age_days: 文件日期与目标日期允许的最大偏差（天），超限则告警
 
@@ -77,13 +100,13 @@ class ContractInfoManager:
             成功加载的合约数量
 
         Raises:
-            FileNotFoundError: CSV 文件不存在
+            FileNotFoundError: 文件不存在
         """
         csv_path = Path(csv_path)
         if not csv_path.exists():
             raise FileNotFoundError(f"optionchain 文件不存在: {csv_path}")
 
-        # 版本校验：从文件名提取日期，防止使用过期乘数
+        # 版本校验：从文件名提取日期，防止使用过期乘数（xlsx 无日期前缀则跳过）
         try:
             stem = csv_path.stem  # e.g. 2026-03-04_optionchain
             file_date_str = stem.split("_")[0]
@@ -100,23 +123,43 @@ class ContractInfoManager:
             pass
 
         logger.info("加载合约信息: %s", csv_path)
-        count = 0
 
-        with open(csv_path, "r", encoding="utf-8-sig") as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                try:
-                    info = self._parse_optionchain_row(row)
-                    if info is not None:
-                        self.contracts[info.contract_code] = info
-                        count += 1
-                except Exception as e:
-                    logger.warning("解析 optionchain 行失败（跳过）: %s | 行: %s", e, row)
-                    continue
+        if csv_path.suffix.lower() == ".xlsx":
+            rows = self._read_xlsx_as_dicts(csv_path)
+        else:
+            with open(csv_path, "r", encoding="utf-8-sig") as f:
+                rows = list(csv.DictReader(f))
+
+        count = 0
+        for row in rows:
+            try:
+                info = self._parse_optionchain_row(row)
+                if info is not None:
+                    self.contracts[info.contract_code] = info
+                    count += 1
+            except Exception as e:
+                logger.warning("解析 optionchain 行失败（跳过）: %s | 行: %s", e, row)
 
         self._pairs_cache.clear()
         logger.info("成功加载 %d 条合约信息", count)
         return count
+
+    def _read_xlsx_as_dicts(self, path: Path) -> list:
+        """将 Wind 导出 xlsx 按列位置读取，转换为标准字段名的 dict 列表。"""
+        try:
+            import pandas as pd
+        except ImportError as e:
+            raise RuntimeError("读取 xlsx 需要 pandas：pip install pandas openpyxl") from e
+
+        df = pd.read_excel(path, header=0, dtype=str)
+        # 只取前 9 列（忽略多余列）
+        n_cols = min(len(df.columns), len(self._XLSX_COL_NAMES))
+        df = df.iloc[:, :n_cols].copy()
+        df.columns = self._XLSX_COL_NAMES[:n_cols]
+        # 去掉全空行及非合约行（合约代码首字符必须为数字，过滤 Wind 水印行等）
+        df = df.dropna(how="all")
+        df = df[df["option_code"].str.match(r"^\d", na=False)]
+        return df.to_dict(orient="records")
 
     def get_info(self, contract_code: str) -> Optional[ContractInfo]:
         """

@@ -26,6 +26,10 @@ _EXTERNAL_LINK_RE = re.compile(r"externalLink(\d+)\.xml$")
 # ---------------------------------------------------------------------------
 _CF_TEXT = 1
 _XTYP_REQUEST = 0x20B0
+_XTYP_ADVSTART = 0x1030
+_XTYP_ADVSTOP = 0x8040
+_XTYP_ADVDATA = 0x4010
+_DDE_FACK = 0x8000
 _APPCMD_CLIENTONLY = 0x00000010
 _CP_WINUNICODE = 1200
 _DDE_TIMEOUT_MS = 10000
@@ -94,6 +98,10 @@ def _setup_ddeml():
     u32.DdeUninitialize.restype = wintypes.BOOL
     u32.DdeGetLastError.argtypes = [wintypes.DWORD]
     u32.DdeGetLastError.restype = wintypes.UINT
+    u32.DdeQueryStringW.argtypes = [
+        wintypes.DWORD, ctypes.c_void_p, ctypes.c_wchar_p, wintypes.DWORD, ctypes.c_int,
+    ]
+    u32.DdeQueryStringW.restype = wintypes.DWORD
     return u32
 
 
@@ -440,7 +448,7 @@ class DDERouteParser:
 
 
 class DDEClientManager:
-    """DDE 连接池与轮询客户端（ctypes DDEML 直连，原始字节，无编码损失）。"""
+    """DDE 连接池，支持 REQUEST（轮询）和 ADVISE（热链接推送）两种模式。"""
 
     def __init__(
         self,
@@ -466,15 +474,56 @@ class DDEClientManager:
         self._lock = threading.Lock()
         self._initialized = False
 
+        # ADVISE 模式数据结构
+        self._advise_lock = threading.Lock()
+        self._advise_snapshot: Dict[str, Dict[str, Optional[float]]] = {}  # topic → {field → value}
+        self._dirty_topics: set = set()
+        self._topic_to_codes: Dict[str, List[str]] = {}  # topic → [contract_codes]
+
         self._init_dde()
 
     @property
     def initialized(self) -> bool:
         return self._initialized
 
-    @staticmethod
-    def _dde_callback(_uType, _uFmt, _hconv, _hsz1, _hsz2, _hdata, _dw1, _dw2):
+    def _dde_callback(self, uType, uFmt, hconv, hsz1, hsz2, hdata, dw1, dw2):
+        if uType == _XTYP_ADVDATA:
+            try:
+                topic = self._query_string(hsz1)
+                item = self._query_string(hsz2)
+                if topic and item:
+                    value = self._read_advise_data(hdata)
+                    if value is not None and "VOLUME" in item.upper():
+                        value = float(int(round(value)))
+                    with self._advise_lock:
+                        self._advise_snapshot.setdefault(topic, {})[item] = value
+                        self._dirty_topics.add(topic)
+            except Exception:
+                pass
+            return _DDE_FACK
         return 0
+
+    def _query_string(self, hsz: ctypes.c_void_p) -> str:
+        """将 HSZ 句柄还原为字符串。"""
+        buf = ctypes.create_unicode_buffer(256)
+        length = self._u32.DdeQueryStringW(self._idInst, hsz, buf, 256, _CP_WINUNICODE)
+        if length > 0:
+            return buf.value
+        return ""
+
+    def _read_advise_data(self, hdata: ctypes.c_void_p) -> Optional[float]:
+        """从 ADVISE 回调中的 hdata 句柄读取并解析数据（不释放句柄，系统拥有）。"""
+        if not hdata:
+            return None
+        cb = wintypes.DWORD(0)
+        pData = self._u32.DdeAccessData(hdata, ctypes.byref(cb))
+        if not pData or cb.value == 0:
+            return None
+        try:
+            raw = ctypes.string_at(pData, cb.value)
+        finally:
+            self._u32.DdeUnaccessData(hdata)
+        return _parse_dde_response(raw)
 
     def _init_dde(self) -> None:
         try:
@@ -614,7 +663,85 @@ class DDEClientManager:
             out[code] = row
         return out
 
+    # ------------------------------------------------------------------
+    # ADVISE（热链接）模式
+    # ------------------------------------------------------------------
+
+    def advise_start_all(self, routes: Dict[str, RouteEntry]) -> Tuple[int, int]:
+        """对所有 (topic, field) 注册 ADVISE 热链接。返回 (成功数, 总数)。"""
+        if not self._initialized:
+            return 0, 0
+        total = ok = 0
+        # 建立 topic → codes 反向映射
+        self._topic_to_codes.clear()
+        for code, entry in routes.items():
+            self._topic_to_codes.setdefault(entry.topic, []).append(code)
+
+        for topic, hConv in self._convs.items():
+            for field in self.request_fields:
+                total += 1
+                hsz_item = self._make_hsz(field)
+                try:
+                    hData = self._u32.DdeClientTransaction(
+                        None, 0, hConv, hsz_item, _CF_TEXT,
+                        _XTYP_ADVSTART, _DDE_TIMEOUT_MS, None,
+                    )
+                    self._pump_messages()
+                    if hData:
+                        ok += 1
+                    else:
+                        err = self._u32.DdeGetLastError(self._idInst)
+                        self.logger.debug(
+                            "ADVISE 注册失败: topic=%s item=%s err=0x%04x", topic, field, err,
+                        )
+                finally:
+                    self._free_hsz(hsz_item)
+        self.logger.info("ADVISE 热链接注册: %d/%d 成功", ok, total)
+        return ok, total
+
+    def advise_stop_all(self) -> None:
+        """取消所有 ADVISE 热链接。"""
+        if not self._initialized:
+            return
+        for topic, hConv in self._convs.items():
+            for field in self.request_fields:
+                hsz_item = self._make_hsz(field)
+                try:
+                    self._u32.DdeClientTransaction(
+                        None, 0, hConv, hsz_item, _CF_TEXT,
+                        _XTYP_ADVSTOP, _DDE_TIMEOUT_MS, None,
+                    )
+                except Exception:
+                    pass
+                finally:
+                    self._free_hsz(hsz_item)
+        self._pump_messages()
+
+    def pump_and_collect(self) -> Dict[str, Dict[str, Optional[float]]]:
+        """泵 Windows 消息（触发回调），返回有变化的 {topic: {field: value}}。"""
+        self._pump_messages()
+        with self._advise_lock:
+            if not self._dirty_topics:
+                return {}
+            out = {}
+            for topic in self._dirty_topics:
+                snapshot = self._advise_snapshot.get(topic)
+                if snapshot:
+                    out[topic] = dict(snapshot)
+            self._dirty_topics.clear()
+            return out
+
+    def get_full_snapshot(self) -> Dict[str, Dict[str, Optional[float]]]:
+        """返回所有 topic 的当前快照（用于 staleness 检查）。"""
+        with self._advise_lock:
+            return {t: dict(s) for t, s in self._advise_snapshot.items()}
+
+    # ------------------------------------------------------------------
+    # 生命周期
+    # ------------------------------------------------------------------
+
     def close(self) -> None:
+        self.advise_stop_all()
         with self._lock:
             for hConv in self._convs.values():
                 try:
@@ -623,6 +750,7 @@ class DDEClientManager:
                     pass
             self._convs.clear()
             self._topic_server.clear()
+            self._topic_to_codes.clear()
             if self._idInst.value:
                 try:
                     self._u32.DdeUninitialize(self._idInst)
