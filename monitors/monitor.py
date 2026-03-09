@@ -68,13 +68,34 @@ logging.basicConfig(
 # Rich 显示构建
 # ──────────────────────────────────────────────────────────────────────
 
+_TRADE_DATE_SET: Optional[set] = None
+
+
+def _get_trade_date_set() -> set:
+    """懒加载 A 股交易日历（akshare），失败时回退到纯工作日计算。"""
+    global _TRADE_DATE_SET
+    if _TRADE_DATE_SET is None:
+        try:
+            import akshare as ak
+            cal = ak.tool_trade_date_hist_sina()
+            _TRADE_DATE_SET = set(cal["trade_date"].tolist())  # datetime.date 对象
+        except Exception:
+            _TRADE_DATE_SET = set()  # 空集触发回退
+    return _TRADE_DATE_SET
+
+
 def _trading_days_until(expiry: date, today: date) -> int:
-    """从 today 到 expiry（含）的工作日数（周一~周五，不含节假日）。"""
+    """从 today 到 expiry（含）的 A 股交易日数；无法获取日历时回退到工作日数。"""
+    trade_set = _get_trade_date_set()
     count = 0
     d = today
     while d <= expiry:
-        if d.weekday() < 5:
-            count += 1
+        if trade_set:
+            if d in trade_set:
+                count += 1
+        else:
+            if d.weekday() < 5:
+                count += 1
         d += timedelta(days=1)
     return count
 
@@ -128,21 +149,21 @@ def _build_etf_table(
             header_style="bold cyan",
             show_edge=False,
             expand=True,
-            padding=(0, 1),
+            padding=(0, 0),
         )
         tbl.add_column("行权价", width=6,  justify="left")
         tbl.add_column("方向",   width=4,  justify="center")
         tbl.add_column("净利润", width=7,  justify="right")
+        tbl.add_column("Net_1T", width=7,  justify="right")
+        tbl.add_column("TOL",    width=6,  justify="right")
         tbl.add_column("Max_Qty", width=6, justify="right")
         tbl.add_column("SPRD",   width=5,  justify="right")
         tbl.add_column("OBI_C",  width=5,  justify="right")
-        tbl.add_column("OBI_S",  width=5,  justify="right")
         tbl.add_column("OBI_P",  width=5,  justify="right")
-        tbl.add_column("Net_1T", width=7,  justify="right")
-        tbl.add_column("TOL",    width=6,  justify="right")
+        tbl.add_column("OBI_S",  width=5,  justify="right")
         tbl.add_column("C_b",    width=7,  justify="right")
         tbl.add_column("P_a",    width=7,  justify="right")
-        tbl.add_column("S",      width=7,  justify="right")
+        tbl.add_column("S_a",    width=7,  justify="right")
         # 乘数列已移至每组 Rule 标题，此处不再单独列出
         return tbl
 
@@ -159,13 +180,13 @@ def _build_etf_table(
             f"{sig.strike:.2f}{adj_tag}",
             dir_str,
             profit_str,
+            f"{sig.net_1tick:.0f}" if sig.net_1tick is not None else "--",
+            f"{sig.tolerance:.2f}" if sig.tolerance is not None else "--",
             f"{sig.max_qty:.2f}" if sig.max_qty is not None else "--",
             f"{sig.spread_ratio * 100:.1f}%" if sig.spread_ratio is not None else "--",
             f"{sig.obi_c:.2f}" if sig.obi_c is not None else "--",
-            f"{sig.obi_s:.2f}" if sig.obi_s is not None else "--",
             f"{sig.obi_p:.2f}" if sig.obi_p is not None else "--",
-            f"{sig.net_1tick:.0f}" if sig.net_1tick is not None else "--",
-            f"{sig.tolerance:.2f}" if sig.tolerance is not None else "--",
+            f"{sig.obi_s:.2f}" if sig.obi_s is not None else "--",
             f"{sig.call_bid:.4f}",
             f"{sig.put_ask:.4f}",
             f"{sig.spot_price:.4f}",
@@ -190,7 +211,7 @@ def _build_etf_table(
     renderables.append(_make_table(show_header=True))
 
     for (expiry, mult), group in sorted(by_expiry_mult.items()):
-        cal_days = (expiry - today).days
+        cal_days = (expiry - today).days + 1  # 含今天和到期日两端
         trade_days = _trading_days_until(expiry, today)
 
         # 居中 Rule 标题，含到期日、自然日、交易日、乘数
