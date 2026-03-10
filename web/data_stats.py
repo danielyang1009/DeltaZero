@@ -215,21 +215,19 @@ def merge_status_readable(market_data_dir: str, target_date: Optional[date] = No
     d = target_date or bj_today()
     d_str = d.strftime("%Y%m%d")
     root = Path(market_data_dir)
-    opt = root / f"options_{d_str}.parquet"
-    etf = root / f"etf_{d_str}.parquet"
 
-    opt_ok = opt.exists()
-    etf_ok = etf.exists()
+    # 兼容两种布局：根目录直接放 / 品种子目录分放
+    opt_files = list(root.glob(f"options_{d_str}.parquet")) + list(root.glob(f"*/options_{d_str}.parquet"))
+    etf_files = list(root.glob(f"etf_{d_str}.parquet")) + list(root.glob(f"*/etf_{d_str}.parquet"))
+
+    opt_ok = len(opt_files) > 0
+    etf_ok = len(etf_files) > 0
     merged_any = opt_ok or etf_ok
     merged_full = opt_ok and etf_ok
 
     latest_mtime: Optional[datetime] = None
     if merged_any:
-        mtimes = []
-        if opt_ok:
-            mtimes.append(opt.stat().st_mtime)
-        if etf_ok:
-            mtimes.append(etf.stat().st_mtime)
+        mtimes = [f.stat().st_mtime for f in opt_files + etf_files]
         if mtimes:
             latest_mtime = bj_from_timestamp(max(mtimes)).replace(tzinfo=None)
 

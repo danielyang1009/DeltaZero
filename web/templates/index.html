@@ -53,8 +53,9 @@ pre{background:#0f172a;color:#e2e8f0;padding:10px;border-radius:8px;max-height:1
 <div class="row">
   <div class="card">
     <div class="card-title">DDE</div>
-    <div>
-      <button class="btn-primary" onclick="window.open('/dde','_blank')">打开 DDE 抓取面板</button>
+    <div style="display:flex;gap:8px;flex-wrap:wrap">
+      <button class="btn-primary" onclick="window.open('/dde','_blank')">DDE 抓取面板</button>
+      <a href="/vol_smile" target="_blank" style="text-decoration:none"><button class="btn-primary">波动率微笑</button></a>
     </div>
     <div id="metadataFiles" style="margin-top:8px;font-size:12px;color:#64748b"></div>
   </div>
@@ -75,8 +76,8 @@ pre{background:#0f172a;color:#e2e8f0;padding:10px;border-radius:8px;max-height:1
   <div class="card">
     <div class="card-title">Yieldcurve</div>
     <div style="display:flex;gap:8px;flex-wrap:wrap">
-      <button class="btn-secondary btn-sm" id="btnFetchCgb" onclick="runFetchBond('cgb')">抓取 CGB</button>
-      <button class="btn-secondary btn-sm" id="btnFetchShibor" onclick="runFetchBond('shibor')">抓取 Shibor</button>
+      <button class="btn-primary" id="btnFetchCgb" onclick="runFetchBond('cgb')">抓取 CGB</button>
+      <button class="btn-primary" id="btnFetchShibor" onclick="runFetchBond('shibor')">抓取 Shibor</button>
     </div>
     <div id="bondFilesInfo" style="margin-top:8px;font-size:12px;color:#64748b"></div>
   </div>

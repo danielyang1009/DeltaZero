@@ -1,0 +1,304 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>波动率微笑 — DeltaZero</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.2/dist/chart.umd.min.js"></script>
+<style>
+*{box-sizing:border-box}
+body{font-family:"Segoe UI",Arial,sans-serif;margin:0;padding:16px 20px;background:#f0f2f5;color:#1a1a2e}
+h1{margin:0 0 12px;font-size:20px}
+.controls{display:flex;gap:12px;flex-wrap:wrap;align-items:center;background:#fff;border:1px solid #dde1ea;border-radius:10px;padding:12px 16px;margin-bottom:12px}
+.controls label{font-size:13px;color:#475569;margin-right:4px}
+.controls select,.controls input{padding:4px 8px;border:1px solid #cbd5e1;border-radius:6px;font-size:13px}
+.controls input[type=number]{width:70px}
+.btn-sm{padding:4px 10px;font-size:12px}
+.chart-card{background:#fff;border:1px solid #dde1ea;border-radius:10px;padding:16px;position:relative}
+#statusBar{font-size:12px;color:#64748b;margin-top:8px;text-align:right}
+#errorMsg{font-size:13px;color:#dc2626;margin-top:8px;display:none}
+#loadingMsg{font-size:13px;color:#2563eb;margin-top:8px;display:none}
+#chartContainer{position:relative;height:460px}
+</style>
+</head>
+<body>
+<h1>📈 波动率微笑</h1>
+
+<div class="controls">
+  <span>
+    <label>品种</label>
+    <select id="selUnderlying">
+      <option value="510050.SH">50ETF</option>
+      <option value="510300.SH">300ETF</option>
+      <option value="510500.SH">500ETF</option>
+    </select>
+  </span>
+  <span>
+    <label>到期日</label>
+    <select id="selExpiry" style="min-width:120px"><option value="">-- 加载中 --</option></select>
+  </span>
+  <span>
+    <label>合约类型</label>
+    <select id="selAdjusted" onchange="restartPolling()">
+      <option value="false">标准合约</option>
+      <option value="true">调整合约</option>
+    </select>
+  </span>
+  <span>
+    <label>刷新间隔</label>
+    <input id="inpInterval" type="number" value="5" min="1" max="60"/>秒
+  </span>
+</div>
+
+<div class="chart-card">
+  <div id="chartContainer">
+    <canvas id="smileChart"></canvas>
+  </div>
+  <div id="loadingMsg">加载中...</div>
+  <div id="errorMsg"></div>
+  <div id="statusBar">—</div>
+</div>
+
+<script>
+let chart = null;
+let timerId = null;
+let _spotLine = null;
+
+function initChart() {
+  const ctx = document.getElementById('smileChart').getContext('2d');
+  chart = new Chart(ctx, {
+    type: 'line',
+    data: {
+      datasets: [
+        {
+          label: 'Call',
+          data: [],
+          borderColor: '#ef4444',
+          backgroundColor: 'rgba(239,68,68,0.08)',
+          pointRadius: 4,
+          pointHoverRadius: 6,
+          tension: 0.3,
+          borderWidth: 2,
+        },
+        {
+          label: 'Put',
+          data: [],
+          borderColor: '#16a34a',
+          backgroundColor: 'rgba(22,163,74,0.08)',
+          pointRadius: 4,
+          pointHoverRadius: 6,
+          tension: 0.3,
+          borderWidth: 2,
+        },
+      ]
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      interaction: { mode: 'index', intersect: false },
+      plugins: {
+        legend: { position: 'top' },
+        tooltip: {
+          callbacks: {
+            label: ctx => `${ctx.dataset.label}: ${(ctx.parsed.y * 100).toFixed(2)}%`,
+          }
+        },
+        annotation: {},
+      },
+      scales: {
+        x: {
+          type: 'linear',
+          title: { display: true, text: '行权价' },
+          ticks: { callback: v => v.toFixed(3) },
+        },
+        y: {
+          title: { display: true, text: '隐含波动率 (%)' },
+          ticks: { callback: v => (v * 100).toFixed(1) + '%' },
+        }
+      }
+    }
+  });
+}
+
+function updateChart(data) {
+  if (!chart) return;
+
+  const callPts = (data.calls || []).map(d => ({ x: d.strike, y: d.iv }));
+  const putPts  = (data.puts  || []).map(d => ({ x: d.strike, y: d.iv }));
+
+  chart.data.datasets[0].data = callPts;
+  chart.data.datasets[1].data = putPts;
+
+  // spot 竖线（用注释插件 annotation 或画在 afterDraw）
+  chart.options._spotVal = data.spot;
+
+  // 动态调整 y 轴范围
+  const allIVs = [...callPts, ...putPts].map(p => p.y).filter(v => v != null && isFinite(v));
+  if (allIVs.length > 0) {
+    const minIV = Math.max(0, Math.min(...allIVs) - 0.02);
+    const maxIV = Math.max(...allIVs) + 0.02;
+    chart.options.scales.y.min = minIV;
+    chart.options.scales.y.max = maxIV;
+  }
+
+  chart.update();
+  drawSpotLine(data.spot);
+}
+
+function drawSpotLine(spot) {
+  if (!chart || spot == null) return;
+  // 在 afterDraw 中绘制 spot 竖线
+  chart._spotVal = spot;
+}
+
+// 自定义插件：在图表上绘制 spot 竖线
+const spotLinePlugin = {
+  id: 'spotLine',
+  afterDraw(chart) {
+    const spot = chart._spotVal;
+    if (spot == null) return;
+    const xScale = chart.scales.x;
+    if (!xScale) return;
+    const xPx = xScale.getPixelForValue(spot);
+    if (xPx < xScale.left || xPx > xScale.right) return;
+    const ctx = chart.ctx;
+    ctx.save();
+    ctx.beginPath();
+    ctx.moveTo(xPx, chart.chartArea.top);
+    ctx.lineTo(xPx, chart.chartArea.bottom);
+    ctx.strokeStyle = 'rgba(37,99,235,0.6)';
+    ctx.lineWidth = 1.5;
+    ctx.setLineDash([5, 4]);
+    ctx.stroke();
+    ctx.fillStyle = 'rgba(37,99,235,0.9)';
+    ctx.font = '11px sans-serif';
+    ctx.fillText(`Spot ${spot.toFixed(3)}`, xPx + 4, chart.chartArea.top + 14);
+    ctx.restore();
+  }
+};
+Chart.register(spotLinePlugin);
+
+function getAdjusted() {
+  return document.getElementById('selAdjusted').value; // "true" or "false"
+}
+
+// 记录哪些到期日有调整合约
+let _adjustedExpiries = new Set();
+
+function updateAdjustedSelector() {
+  const expiry = document.getElementById('selExpiry').value;
+  const sel = document.getElementById('selAdjusted');
+  const adjOpt = sel.querySelector('option[value="true"]');
+  if (!adjOpt) return;
+  const hasAdj = _adjustedExpiries.has(expiry);
+  adjOpt.hidden = !hasAdj;
+  adjOpt.disabled = !hasAdj;
+  if (!hasAdj && sel.value === 'true') {
+    sel.value = 'false';
+  }
+}
+
+async function loadExpiries() {
+  const underlying = document.getElementById('selUnderlying').value;
+  const sel = document.getElementById('selExpiry');
+  sel.innerHTML = '<option value="">-- 加载中 --</option>';
+  _adjustedExpiries = new Set();
+  try {
+    // 并行拉取标准和调整合约的到期日
+    const [rStd, rAdj] = await Promise.all([
+      fetch(`/api/vol_smile/expiries?underlying=${encodeURIComponent(underlying)}&adjusted=false`),
+      fetch(`/api/vol_smile/expiries?underlying=${encodeURIComponent(underlying)}&adjusted=true`),
+    ]);
+    const [dStd, dAdj] = await Promise.all([rStd.json(), rAdj.json()]);
+    const stdExpiries = (dStd.ok && dStd.expiries) ? dStd.expiries : [];
+    const adjExpiries = (dAdj.ok && dAdj.expiries) ? dAdj.expiries : [];
+    _adjustedExpiries = new Set(adjExpiries);
+    if (!stdExpiries.length) {
+      sel.innerHTML = '<option value="">暂无数据</option>';
+      return;
+    }
+    sel.innerHTML = stdExpiries.map(e => `<option value="${e}">${e}</option>`).join('');
+    updateAdjustedSelector();
+    restartPolling();
+  } catch(e) {
+    sel.innerHTML = '<option value="">加载失败</option>';
+  }
+}
+
+function restartPolling() {
+  stopPolling();
+  const expiry = document.getElementById('selExpiry').value;
+  if (expiry) startPolling();
+}
+
+
+async function fetchOnce() {
+  const underlying = document.getElementById('selUnderlying').value;
+  const expiry = document.getElementById('selExpiry').value;
+  if (!expiry) { showError('请先选择到期日'); return; }
+
+  showLoading(true);
+  clearError();
+  try {
+    const adjusted = getAdjusted();
+  const r = await fetch(`/api/vol_smile?underlying=${encodeURIComponent(underlying)}&expiry=${encodeURIComponent(expiry)}&adjusted=${adjusted}`);
+    const d = await r.json();
+    if (!d.ok) { showError(d.detail || '请求失败'); return; }
+    updateChart(d);
+    document.getElementById('statusBar').textContent =
+      `数据时间：${d.timestamp}  |  利率：${d.rate_str}  |  Spot：${d.spot != null ? d.spot.toFixed(4) : '-'}  |  F：${d.forward != null ? d.forward.toFixed(4) : '-'}  |  ATM：${d.atm_strike ?? '-'}  |  Call ${d.calls.length} 点  Put ${d.puts.length} 点`;
+  } catch(e) {
+    showError('网络错误：' + e.message);
+  } finally {
+    showLoading(false);
+  }
+}
+
+function startPolling() {
+  if (timerId) return;
+  fetchOnce();
+  const interval = Math.max(1, parseInt(document.getElementById('inpInterval').value) || 5) * 1000;
+  timerId = setInterval(fetchOnce, interval);
+}
+
+function stopPolling() {
+  if (timerId) { clearInterval(timerId); timerId = null; }
+}
+
+function showError(msg) {
+  const el = document.getElementById('errorMsg');
+  el.textContent = msg;
+  el.style.display = 'block';
+}
+function clearError() {
+  document.getElementById('errorMsg').style.display = 'none';
+}
+function showLoading(v) {
+  document.getElementById('loadingMsg').style.display = v ? 'block' : 'none';
+}
+
+document.getElementById('selUnderlying').addEventListener('change', () => {
+  stopPolling();
+  loadExpiries();
+});
+
+document.getElementById('inpInterval').addEventListener('change', () => {
+  // 间隔变更：若正在轮询则用新间隔重启定时器（不立即 fetch）
+  if (timerId) {
+    clearInterval(timerId);
+    const interval = Math.max(1, parseInt(document.getElementById('inpInterval').value) || 5) * 1000;
+    timerId = setInterval(fetchOnce, interval);
+  }
+});
+
+document.getElementById('selExpiry').addEventListener('change', () => {
+  updateAdjustedSelector();
+  restartPolling();
+});
+
+// 初始化
+initChart();
+loadExpiries();
+</script>
+</body>
+</html>

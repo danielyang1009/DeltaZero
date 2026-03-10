@@ -145,3 +145,48 @@ Monitor 每行除净利润外，还展示以下辅助指标，用于判断能否
 
 不使用仓库根目录存储运行数据。
 
+## 波动率微笑（Vol Smile）
+
+访问 `http://127.0.0.1:8787/vol_smile`，支持实时展示 50ETF / 300ETF / 500ETF 期权的隐含波动率微笑曲线。
+
+### 核心算法：Black-76 + 隐含远期（Implied Forward）
+
+为规避 A 股市场融券成本高昂及股息率（$q$）难以估计的问题，彻底弃用标准 Black-Scholes 中的现货价格 $S$ 与股息率 $q$，改用**隐含远期 + Black-76**框架。
+
+#### Step 1：倒算隐含远期价格 $F$
+
+从同一行权价的认购、认沽中间价出发，利用 Put-Call Parity 反推：
+
+$$F = K_{atm} + (C_{mid} - P_{mid}) \cdot e^{rT}$$
+
+其中 $K_{atm}$ 为满足 $\arg\min |C_{mid} - P_{mid}|$ 的行权价（市场隐含平值点）。
+$F$ 已内化了市场对股息、借券成本与基差的全部预期，是后续计算其他所有虚值/实值期权 IV 的"现货替代锚"。
+
+#### Step 2：Black-76 模型定价
+
+$$d_1 = \frac{\ln(F/K) + (\sigma^2/2) \cdot T}{\sigma\sqrt{T}}, \quad d_2 = d_1 - \sigma\sqrt{T}$$
+
+$$Call = e^{-rT}\left[F \cdot N(d_1) - K \cdot N(d_2)\right]$$
+
+$$Put = e^{-rT}\left[K \cdot N(-d_2) - F \cdot N(-d_1)\right]$$
+
+#### Step 3：Brent 法求解 IV
+
+对每个行权价求解：
+
+$$\sigma^* = \text{Brent}\left\{\sigma : \text{Black76}(F, K, T, r, \sigma) = \text{Price}_{mid}\right\}, \quad \sigma \in [0.01\%, 500\%]$$
+
+Brent 法（二分 + 割线法结合）在深度虚值期权（Vega 极小、Newton-Raphson 极易不收敛）场景下具有绝对稳健性。
+
+### 实现文件
+
+| 文件 | 说明 |
+|------|------|
+| `calculators/iv_calculator.py` | `calc_implied_forward()` + `black76_price()` + `calc_iv_black76()` |
+| `web/dashboard.py` | `/api/vol_smile/expiries` + `/api/vol_smile` 端点 |
+| `web/templates/vol_smile.html` | 前端页面（Chart.js，看涨红线 / 看跌绿线，Spot 竖线） |
+
+### 无风险利率
+
+优先从当日中债国债收益率曲线（`cgb_yieldcurve_YYYYMMDD.csv`）按实际剩余期限取值，7 日内无文件则回退固定 2%。
+

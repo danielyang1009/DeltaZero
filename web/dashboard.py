@@ -11,11 +11,15 @@ import threading
 import time
 
 import psutil
+import scipy.optimize  # noqa: F401 — 预加载 Intel MKL/libifcoremd，避免首次访问 vol_smile 时才触发
+import scipy.interpolate  # noqa: F401
+import scipy.stats  # noqa: F401
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
 from config.settings import DEFAULT_MARKET_DATA_DIR
+from web.market_cache import get_snapshot, start as start_market_cache, stop as stop_market_cache
 from web.data_stats import (
     chunks_readable,
     count_today_chunks,
@@ -41,8 +45,19 @@ from utils.time_utils import bj_now_naive, bj_today
 
 TEMPLATE_PATH = Path(__file__).resolve().parent / "templates" / "index.html"
 DDE_TEMPLATE_PATH = Path(__file__).resolve().parent / "templates" / "dde.html"
+VOL_SMILE_TEMPLATE_PATH = Path(__file__).resolve().parent / "templates" / "vol_smile.html"
 
 app = FastAPI(title="DeltaZero Web Console", version="0.3.0")
+
+
+@app.on_event("startup")
+async def _startup() -> None:
+    start_market_cache()
+
+
+@app.on_event("shutdown")
+async def _shutdown() -> None:
+    stop_market_cache()
 _dde_lock = threading.Lock()
 _dde_feeder = None
 _dde_routes_cache: Dict[str, Any] = {"key": "", "routes": {}}
@@ -349,6 +364,11 @@ def index() -> str:
 @app.get("/dde", response_class=HTMLResponse)
 def dde_page() -> str:
     return DDE_TEMPLATE_PATH.read_text(encoding="utf-8")
+
+
+@app.get("/vol_smile", response_class=HTMLResponse)
+def vol_smile_page() -> str:
+    return VOL_SMILE_TEMPLATE_PATH.read_text(encoding="utf-8")
 
 
 def _default_dde_excel_files() -> Dict[str, str]:
@@ -716,6 +736,7 @@ def get_state() -> Dict[str, Any]:
             "wxy_options": {"mtime_ago": _file_mtime_ago(_METADATA_DIR / "wxy_options.xlsx")},
         },
         "bond_files": _bond_files_info(),
+        "vol_smile_active_ago": _mtime_ago_str(_vol_smile_last_active) if _vol_smile_last_active else None,
     }
 
 
@@ -906,6 +927,231 @@ def fetch_bond(req: FetchBondRequest) -> Dict[str, Any]:
         "kind": req.kind,
         "output": "\n".join(output),
         "bond_files": _bond_files_info(),
+    }
+
+
+_catalog_cache: Dict[str, Any] = {"mtime": None, "contracts": {}}
+_vol_smile_last_active: float = 0.0
+
+def _load_contract_catalog():
+    """加载 ContractInfoManager，返回 {contract_code: ContractInfo} 字典。基于文件 mtime 缓存，文件未变则直接返回缓存。"""
+    try:
+        from data_engine.contract_catalog import ContractInfoManager, get_optionchain_path
+        path = get_optionchain_path()
+        mtime = path.stat().st_mtime if path.exists() else None
+        if _catalog_cache["mtime"] == mtime and _catalog_cache["contracts"]:
+            return _catalog_cache["contracts"]
+        mgr = ContractInfoManager()
+        mgr.load_from_optionchain(path)
+        _catalog_cache["mtime"] = mtime
+        _catalog_cache["contracts"] = mgr.contracts
+        return mgr.contracts
+    except Exception:
+        return _catalog_cache.get("contracts") or {}
+
+
+@app.get("/api/vol_smile/expiries")
+def vol_smile_expiries(underlying: str = "510050.SH", adjusted: bool = False) -> Dict[str, Any]:
+    """
+    返回指定品种的可用到期日列表，来源：ContractInfoManager（wind_optionchain.xlsx）。
+    若快照存在，只返回快照中实际有报价的到期日。
+    """
+    catalog = _load_contract_catalog()
+    if not catalog:
+        return {"ok": True, "expiries": []}
+
+    # 标准化 underlying 为 .SH 形式
+    from models import normalize_code
+    ul_code = normalize_code(underlying, ".SH")
+
+    # 快照中出现的合约代码集合（加速过滤，可选）
+    snap = get_snapshot()
+    snap_codes: Optional[set] = None
+    if snap:
+        snap_codes = {
+            code for code, rec in snap.items()
+            if str(rec.get("type", "")).lower() != "etf"
+        }
+
+    expiry_set: set[str] = set()
+    for code, info in catalog.items():
+        if info.underlying_code != ul_code:
+            continue
+        if (info.contract_unit != 10000) != adjusted:
+            continue
+        if snap_codes is not None and code not in snap_codes:
+            continue
+        expiry_set.add(info.expiry_date.strftime("%Y-%m-%d"))
+
+    return {"ok": True, "expiries": sorted(expiry_set)}
+
+
+@app.get("/api/vol_smile")
+def vol_smile(underlying: str = "510050.SH", expiry: str = "", adjusted: bool = False) -> Dict[str, Any]:
+    """
+    返回指定品种和到期日的波动率微笑数据（IV vs 行权价）。
+    合约元数据（strike、认购/认沽）来自 ContractInfoManager；
+    价格数据（bid1/ask1）来自 snapshot_latest.parquet。
+    """
+    global _vol_smile_last_active
+    _vol_smile_last_active = time.time()
+
+    if not expiry:
+        raise HTTPException(status_code=400, detail="需要指定 expiry 参数（如 2026-03-20）")
+
+    try:
+        from datetime import datetime as _dt
+        expiry_date = _dt.strptime(expiry, "%Y-%m-%d").date()
+    except ValueError:
+        raise HTTPException(status_code=400, detail=f"expiry 格式错误: {expiry}，应为 YYYY-MM-DD")
+
+    snap_index = get_snapshot()
+    if not snap_index:
+        raise HTTPException(status_code=404, detail="行情缓存为空，请先启动 DataBus 采集数据")
+
+    from models import normalize_code
+    ul_code = normalize_code(underlying, ".SH")
+
+    # 加载合约元数据
+    catalog = _load_contract_catalog()
+    # 筛选本品种、本到期日、指定调整类型的合约，建立 code → ContractInfo
+    target_contracts = {
+        code: info
+        for code, info in catalog.items()
+        if info.underlying_code == ul_code
+        and info.expiry_date == expiry_date
+        and (info.contract_unit != 10000) == adjusted
+    }
+    if not target_contracts:
+        raise HTTPException(status_code=404, detail=f"未找到 {underlying} {expiry} 的合约信息，请检查 wind_sse_optionchain.xlsx")
+
+    # 找 spot
+    import math as _math
+    spot = float("nan")
+    ul_bare = ul_code.replace(".SH", "")
+    for code, rec in snap_index.items():
+        if str(rec.get("type", "")).upper() != "ETF":
+            continue
+        if code.replace(".SH", "").replace(".XSHG", "") == ul_bare:
+            last = rec.get("last")
+            if isinstance(last, (int, float)) and last > 0:
+                spot = float(last)
+                break
+
+    # T（年）
+    from datetime import datetime as _dt2, time as _time
+    expiry_dt = _dt2.combine(expiry_date, _time(15, 0))
+    now_dt = bj_now_naive()
+    T_years = (expiry_dt - now_dt).total_seconds() / (365 * 24 * 3600)
+
+    # 利率
+    r = 0.02
+    rate_str = "2.00% (固定)"
+    if T_years > 0:
+        try:
+            from calculators.yield_curve import BoundedCubicSplineRate as _BCS
+            import warnings as _w
+            with _w.catch_warnings():
+                _w.simplefilter("ignore")
+                _curve = _BCS.from_cgb_daily(require_exists=True)
+            r = _curve.get_rate(T_years * 365)
+            rate_str = f"{r*100:.2f}% (CGB)"
+        except Exception:
+            pass
+
+    if T_years <= 0:
+        return {
+            "ok": True,
+            "spot": round(spot, 4) if not _math.isnan(spot) else None,
+            "rate": round(r, 6),
+            "rate_str": rate_str,
+            "timestamp": now_dt.strftime("%H:%M:%S"),
+            "calls": [],
+            "puts": [],
+        }
+
+    from calculators.iv_calculator import calc_implied_forward, calc_iv_black76
+    from models import OptionType
+
+    # ── Step 1: 收集所有行权价的 call/put 中间价 ──────────────────────
+    def _safe_mid(rec) -> float:
+        try:
+            b = float(rec.get("bid1") or "nan")
+            a = float(rec.get("ask1") or "nan")
+        except (TypeError, ValueError):
+            return float("nan")
+        if b > 0 and a > 0:
+            return (b + a) / 2.0
+        return float("nan")
+
+    call_mids: Dict[float, float] = {}  # strike → mid
+    put_mids:  Dict[float, float] = {}
+    call_codes: Dict[float, Any] = {}
+    put_codes:  Dict[float, Any] = {}
+
+    for code, info in target_contracts.items():
+        rec = snap_index.get(code)
+        if rec is None:
+            continue
+        strike = info.strike_price
+        if not strike or _math.isnan(strike) or strike <= 0:
+            continue
+        mid = _safe_mid(rec)
+        if _math.isnan(mid):
+            continue
+        if info.option_type == OptionType.CALL:
+            call_mids[strike] = mid
+            call_codes[strike] = info
+        else:
+            put_mids[strike] = mid
+            put_codes[strike] = info
+
+    # ── Step 2: 查找 ATM 行权价（同时有 call 和 put 且最接近 spot）──
+    common_strikes = sorted(set(call_mids) & set(put_mids))
+    if not common_strikes:
+        return {
+            "ok": True,
+            "spot": round(spot, 4) if not _math.isnan(spot) else None,
+            "rate": round(r, 6),
+            "rate_str": rate_str,
+            "timestamp": now_dt.strftime("%H:%M:%S"),
+            "forward": None,
+            "calls": [],
+            "puts": [],
+        }
+
+    K_atm = min(common_strikes, key=lambda k: abs(call_mids[k] - put_mids[k]))
+
+    # ── Step 3: 倒算隐含远期价格 F ───────────────────────────────────
+    F = calc_implied_forward(K_atm, call_mids[K_atm], put_mids[K_atm], T_years, r)
+
+    # ── Step 4: Black-76 批量求 IV ────────────────────────────────────
+    calls_map: Dict[float, Dict[str, Any]] = {}
+    puts_map:  Dict[float, Dict[str, Any]] = {}
+
+    for strike, mid in call_mids.items():
+        iv = calc_iv_black76(F, strike, T_years, r, mid, "C")
+        if not _math.isnan(iv):
+            calls_map[strike] = {"strike": strike, "iv": round(iv, 6), "mid": round(mid, 6)}
+
+    for strike, mid in put_mids.items():
+        iv = calc_iv_black76(F, strike, T_years, r, mid, "P")
+        if not _math.isnan(iv):
+            puts_map[strike] = {"strike": strike, "iv": round(iv, 6), "mid": round(mid, 6)}
+
+    calls = [v for _, v in sorted(calls_map.items())]
+    puts  = [v for _, v in sorted(puts_map.items())]
+
+    return {
+        "ok": True,
+        "spot": round(spot, 4) if not _math.isnan(spot) else None,
+        "forward": round(F, 4),
+        "atm_strike": K_atm,
+        "rate": round(r, 6),
+        "rate_str": rate_str,
+        "timestamp": now_dt.strftime("%H:%M:%S"),
+        "calls": calls,
+        "puts": puts,
     }
 
 

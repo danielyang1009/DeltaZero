@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import os
 os.environ.setdefault("NUMEXPR_MAX_THREADS", "16")
+os.environ.setdefault("FOR_DISABLE_CONSOLE_CTRL_HANDLER", "1")  # 禁止 Intel Fortran 运行时注册 Ctrl+C 处理器
 
 import argparse
 import logging
