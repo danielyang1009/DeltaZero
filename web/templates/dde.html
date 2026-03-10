@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>DDE 抓取结果</title>
+<title>DDE 监控面板</title>
 <style>
 *{box-sizing:border-box}
 body{font-family:"Segoe UI",Arial,sans-serif;margin:0;padding:16px 20px;background:#f5f7fb;color:#1e293b}
@@ -12,9 +12,6 @@ h1{margin:0 0 12px;font-size:22px}
 .row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
 .kv{font-size:13px;color:#475569}
 button{padding:6px 14px;border:none;border-radius:6px;font-size:13px;cursor:pointer;font-weight:600}
-button:disabled{opacity:.5;cursor:not-allowed}
-.btn-primary{background:#2563eb;color:#fff}
-.btn-danger{background:#dc2626;color:#fff}
 .btn-secondary{background:#64748b;color:#fff}
 table{width:100%;border-collapse:collapse;font-size:12px}
 th{text-align:left;padding:6px 8px;background:#f8fafc;color:#64748b;border-bottom:2px solid #e2e8f0}
@@ -29,24 +26,22 @@ td{padding:5px 8px;border-bottom:1px solid #eef2f7}
 </style>
 </head>
 <body>
-<h1>DDE 抓取结果面板</h1>
+<h1>DDE 监控面板</h1>
 
 <div class="card">
   <div class="row">
-    <button class="btn-primary" id="btnStart" onclick="startDDE()">启动 DDE</button>
-    <button class="btn-danger" id="btnStop" onclick="stopDDE()">停止 DDE</button>
     <button class="btn-secondary" onclick="pollNow()">立即刷新</button>
     <label class="kv">自动刷新 <input type="checkbox" id="autoPoll" checked onchange="toggleAuto()"/></label>
     <label class="kv">间隔(s) <input type="number" id="interval" value="3" min="1" step="1" style="width:60px"/></label>
-    <span class="kv">状态：<span id="running" class="bad">未启动</span></span>
+    <span class="kv">DataBus：<span id="running" class="bad">未运行</span></span>
+    <span class="kv">数据源：<span id="recorderSource">--</span></span>
   </div>
   <div class="row" style="margin-top:8px">
     <span class="kv">最后更新时间：<span id="ts">--</span></span>
-    <span class="kv">路由数：<span id="routeCount">0</span></span>
+    <span class="kv">LKV合约：<span id="lkvCount">0</span></span>
     <span class="kv">有效最新价：<span id="validCount">0</span></span>
-    <span class="kv">STALE 合约：<span id="staleCount">0</span></span>
-    <span class="kv">熔断品种：<span id="fusedText">无</span></span>
-    <span class="kv">数据模式：<span id="dataMode" style="color:#7c3aed">--</span></span>
+    <span class="kv">STALE：<span id="staleCount">0</span></span>
+    <span class="kv">熔断：<span id="fusedText">无</span></span>
   </div>
 </div>
 
@@ -68,7 +63,7 @@ td{padding:5px 8px;border-bottom:1px solid #eef2f7}
         <th>熔断</th>
       </tr>
     </thead>
-    <tbody id="tbody"><tr><td colspan="12" style="color:#94a3b8">等待启动 DDE...</td></tr></tbody>
+    <tbody id="tbody"><tr><td colspan="12" style="color:#94a3b8">等待数据...</td></tr></tbody>
   </table>
 </div>
 
@@ -96,45 +91,14 @@ async function api(url, method="GET", body=null){
   return data;
 }
 
-function setRunning(running){
-  $("running").innerText = running ? "运行中" : "未启动";
-  $("running").className = running ? "good" : "bad";
-  $("btnStart").disabled = running;
-  $("btnStop").disabled = !running;
-}
-
 async function refreshState(){
   try{
     const st = await api("/api/dde/state");
-    setRunning(st.running);
-    $("routeCount").innerText = st.route_count || 0;
-    const modeText = st.data_mode === "databus"
-      ? `databus(${st.recorder_source || "unknown"})`
-      : "direct_dde";
-    $("dataMode").innerText = modeText;
-  }catch(e){
-    toast(e.message, false);
-  }
-}
-
-async function startDDE(){
-  const interval = parseFloat($("interval").value || "3");
-  try{
-    const r = await api("/api/dde/start", "POST", { interval });
-    $("routeCount").innerText = r.route_count || 0;
-    setRunning(true);
-    toast(`DDE 启动成功，路由 ${r.route_count} 条`);
-    await pollNow();
-  }catch(e){
-    toast(e.message, false);
-  }
-}
-
-async function stopDDE(){
-  try{
-    await api("/api/dde/stop", "POST");
-    setRunning(false);
-    toast("DDE 已停止");
+    const running = st.recorder_running && st.recorder_source === "dde";
+    $("running").innerText = running ? "运行中" : "未运行";
+    $("running").className = running ? "good" : "bad";
+    $("recorderSource").innerText = st.recorder_source || "--";
+    $("lkvCount").innerText = `${st.option_count} 期权 + ${st.etf_count} ETF`;
   }catch(e){
     toast(e.message, false);
   }
@@ -144,7 +108,6 @@ async function pollNow(){
   try{
     const r = await api("/api/dde/poll");
     $("ts").innerText = r.time || "--";
-    $("routeCount").innerText = r.route_count || 0;
     $("validCount").innerText = r.valid_last_count || 0;
     const health = r.health || {};
     $("staleCount").innerText = health.stale_count || 0;
@@ -152,7 +115,7 @@ async function pollNow(){
     $("fusedText").innerText = fused.length ? fused.join(", ") : "无";
     const rows = r.rows || [];
     if(rows.length === 0){
-      $("tbody").innerHTML = `<tr><td colspan="12" style="color:#94a3b8">没有返回数据</td></tr>`;
+      $("tbody").innerHTML = `<tr><td colspan="12" style="color:#94a3b8">暂无数据（DataBus 未运行或 LKV 为空）</td></tr>`;
       return;
     }
     $("tbody").innerHTML = rows.map(x => `
@@ -188,6 +151,7 @@ function toggleAuto(){
 }
 
 refreshState();
+pollNow();
 toggleAuto();
 </script>
 </body>

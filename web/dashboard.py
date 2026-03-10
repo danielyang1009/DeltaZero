@@ -9,7 +9,6 @@ import json as _json
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Dict, Optional
-import threading
 import time
 
 import psutil
@@ -103,16 +102,14 @@ async def ws_vol_smile(ws: WebSocket) -> None:
         pass
     finally:
         _ws_clients.discard(ws)
-_dde_lock = threading.Lock()
-_dde_feeder = None
-_dde_routes_cache: Dict[str, Any] = {"key": "", "routes": {}}
+
 _dde_health_cache: Dict[str, Any] = {
     "prev_values": {},
     "last_change_ts": {},
     "contract_status": {},
     "product_fused": {},
     "etf_prices": {},
-    "timeout": 30.0,
+    "timeout": 90.0,
 }
 
 _METADATA_DIR = Path(__file__).resolve().parent.parent / "metadata"
@@ -384,10 +381,6 @@ class MonitorStartRequest(BaseModel):
     option_one_side_fee: float = 1.5
 
 
-class DDEStartRequest(BaseModel):
-    interval: float = 3.0
-
-
 class RecorderStartRequest(BaseModel):
     source: str = Field(default="wind", pattern="^(wind|dde)$")
     zmq_port: int = 5555
@@ -416,26 +409,6 @@ def vol_smile_page() -> str:
     return VOL_SMILE_TEMPLATE_PATH.read_text(encoding="utf-8")
 
 
-def _default_dde_excel_files() -> Dict[str, str]:
-    candidates = {
-        "510050.SH": "metadata/wxy_50etf.xlsx",
-        "510300.SH": "metadata/wxy_300etf.xlsx",
-        "510500.SH": "metadata/wxy_500etf.xlsx",
-    }
-    out: Dict[str, str] = {}
-    for code, rel in candidates.items():
-        if Path(rel).exists():
-            out[code] = rel
-    return out
-
-
-def _require_dde_running():
-    global _dde_feeder
-    if _dde_feeder is None:
-        raise HTTPException(status_code=409, detail="DDE 采集未启动，请先点击“启动 DDE”")
-    return _dde_feeder
-
-
 def _get_running_recorder_source() -> Optional[str]:
     recs = find_recorder_processes()
     if not recs:
@@ -456,105 +429,52 @@ def _ensure_infinitrader_running() -> None:
         )
 
 
-def _get_cached_dde_routes() -> Dict[str, Any]:
-    """
-    懒解析 DDE 路由（用于在 recorder 模式补齐 strike/type/underlying 信息）。
-    """
-    excel_files = _default_dde_excel_files()
-    if not excel_files:
-        return {}
-    key_parts = []
-    for _, rel in sorted(excel_files.items()):
-        p = Path(rel)
-        if p.exists():
-            key_parts.append(f"{rel}:{p.stat().st_mtime}")
-    key = "|".join(key_parts)
-    if _dde_routes_cache.get("key") == key:
-        return _dde_routes_cache.get("routes", {})
-
-    try:
-        from data_engine.dde_adapter import DDERouteParser
-
-        parser = DDERouteParser(excel_files)
-        parser.parse()
-        routes = parser.routes
-    except Exception:
-        routes = {}
-    _dde_routes_cache["key"] = key
-    _dde_routes_cache["routes"] = routes
-    return routes
+@app.get("/api/dde/state")
+def dde_state() -> Dict[str, Any]:
+    snap = get_snapshot()
+    rec_procs = find_recorder_processes()
+    recorder_source = _get_running_recorder_source()
+    return {
+        "recorder_running": len(rec_procs) > 0,
+        "recorder_source": recorder_source,
+        "lkv_count": len(snap),
+        "etf_count": sum(1 for r in snap.values() if str(r.get("type", "")).lower() == "etf"),
+        "option_count": sum(1 for r in snap.values() if str(r.get("type", "")).lower() == "option"),
+    }
 
 
-def _poll_from_recorder_snapshot(wind_info: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
-    """
-    recorder 运行时，从 snapshot_latest.parquet 读取展示数据。
-    """
-    try:
-        import pandas as pd
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"读取 recorder 快照失败（缺少 pandas）: {exc}")
-
-    snap = Path(DEFAULT_MARKET_DATA_DIR) / "snapshot_latest.parquet"
-    if not snap.exists():
-        return {
-            "ok": True,
-            "time": bj_now_naive().strftime("%Y-%m-%d %H:%M:%S"),
-            "route_count": 0,
-            "rows": [],
-            "valid_last_count": 0,
-            "mode": "databus",
-        }
-
-    try:
-        df = pd.read_parquet(str(snap))
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"读取 snapshot_latest.parquet 失败: {exc}")
-
-    routes = _get_cached_dde_routes()
+@app.get("/api/dde/poll")
+def dde_poll() -> Dict[str, Any]:
+    snap = get_snapshot()
+    catalog = _load_contract_catalog()
     rows = []
     valid_last = 0
-    for _, rec in df.iterrows():
-        code = str(rec.get("code", "") or "").strip()
-        if not code:
-            continue
+
+    for code, rec in sorted(snap.items()):
         last = rec.get("last")
-        if isinstance(last, (int, float)):
+        if isinstance(last, (int, float)) and last > 0:
             valid_last += 1
 
-        route = routes.get(code) or routes.get(code.replace(".SH", "").replace(".XSHG", ""))
-        row_type = str(rec.get("type", "") or "").upper()
-        is_etf = row_type == "ETF" or (route is not None and route.option_type == "ETF")
-        strike_val = "" if is_etf else (route.strike if route else "")
-        underlying = ""
-        if route is not None:
-            underlying = (route.underlying or "").replace(".SH", "").replace(".XSHG", "")
-        if not underlying:
-            underlying = str(rec.get("underlying", "") or "").replace(".SH", "").replace(".XSHG", "")
-        if is_etf and not underlying:
-            underlying = code.replace(".SH", "").replace(".XSHG", "")
-
-        expiry_str = ""
-        if not is_etf:
-            code_bare = code.replace(".SH", "").replace(".XSHG", "")
-            info = wind_info.get(code_bare)
-            if info and info.get("expiry_date"):
-                expiry_str = info["expiry_date"].strftime("%Y-%m-%d")
-
-        rows.append(
-            {
+        rec_type = str(rec.get("type", "")).lower()
+        if rec_type == "etf":
+            rows.append({
                 "code": code,
-                "underlying": underlying,
-                "type": ("ETF" if is_etf else (route.option_type if route else "OPTION")),
-                "strike": strike_val,
-                "expiry": expiry_str,
-                "last": rec.get("last"),
-                "bid1": rec.get("bid1"),
-                "ask1": rec.get("ask1"),
-                # snapshot 不包含一档委托量，留空
-                "bidv1": None,
-                "askv1": None,
-            }
-        )
+                "underlying": code.replace(".SH", ""),
+                "type": "ETF", "strike": "", "expiry": "",
+                "last": last, "bid1": rec.get("bid1"), "ask1": rec.get("ask1"),
+                "bidv1": rec.get("bidv1"), "askv1": rec.get("askv1"),
+            })
+        else:
+            info = catalog.get(code)
+            rows.append({
+                "code": code,
+                "underlying": info.underlying_code.replace(".SH", "") if info else str(rec.get("underlying", "")).replace(".SH", ""),
+                "type": info.option_type.value if info else "OPTION",
+                "strike": info.strike_price if info else "",
+                "expiry": info.expiry_date.strftime("%Y-%m-%d") if info else "",
+                "last": last, "bid1": rec.get("bid1"), "ask1": rec.get("ask1"),
+                "bidv1": rec.get("bidv1"), "askv1": rec.get("askv1"),
+            })
 
     rows.sort(key=lambda r: (r["underlying"], r["type"], r["code"]))
     health = _update_dde_health_from_rows(rows)
@@ -562,200 +482,10 @@ def _poll_from_recorder_snapshot(wind_info: Dict[str, Dict[str, Any]]) -> Dict[s
         "ok": True,
         "time": bj_now_naive().strftime("%Y-%m-%d %H:%M:%S"),
         "route_count": len(rows),
-        "rows": rows,
         "valid_last_count": valid_last,
-        "mode": "databus",
+        "rows": rows,
         "health": health,
     }
-
-
-@app.post("/api/dde/start")
-def start_dde(req: DDEStartRequest) -> Dict[str, Any]:
-    global _dde_feeder
-    _ensure_infinitrader_running()
-    with _dde_lock:
-        if _dde_feeder is not None:
-            raise HTTPException(status_code=409, detail="DDE 采集已在运行")
-
-        excel_files = _default_dde_excel_files()
-        if not excel_files:
-            raise HTTPException(status_code=400, detail="未找到 DDE 映射文件（metadata/wxy_*.xlsx）")
-
-        try:
-            from data_engine.dde_adapter import DDEDataFeeder
-        except Exception as exc:
-            raise HTTPException(status_code=500, detail=f"导入 DDE 模块失败: {exc}")
-
-        feeder = DDEDataFeeder(excel_files=excel_files, poll_interval=req.interval)
-        ok = feeder.start()
-        if not ok:
-            feeder.stop()
-            raise HTTPException(status_code=500, detail="DDE 启动失败，请检查交易软件/DDE 配置")
-        _dde_feeder = feeder
-        return {
-            "ok": True,
-            "interval": req.interval,
-            "route_count": len(feeder.routes),
-            "excel_files": excel_files,
-        }
-
-
-@app.post("/api/dde/stop")
-def stop_dde() -> Dict[str, Any]:
-    global _dde_feeder
-    with _dde_lock:
-        if _dde_feeder is None:
-            return {"ok": True, "running": False}
-        try:
-            _dde_feeder.stop()
-        finally:
-            _dde_feeder = None
-    return {"ok": True, "running": False}
-
-
-@app.get("/api/dde/state")
-def dde_state() -> Dict[str, Any]:
-    global _dde_feeder
-    running = _dde_feeder is not None
-    route_count = len(_dde_feeder.routes) if running else 0
-    recorder_source = _get_running_recorder_source()
-    return {
-        "running": running,
-        "route_count": route_count,
-        "data_mode": "databus" if recorder_source else "direct_dde",
-        "recorder_source": recorder_source,
-    }
-
-
-@app.get("/api/dde/poll")
-def dde_poll() -> Dict[str, Any]:
-    wind_info = _load_wind_optionchain()
-    recorder_source = _get_running_recorder_source()
-    if recorder_source:
-        return _poll_from_recorder_snapshot(wind_info)
-
-    if _dde_feeder is None:
-        return {
-            "ok": True,
-            "time": bj_now_naive().strftime("%Y-%m-%d %H:%M:%S"),
-            "route_count": 0,
-            "rows": [],
-            "valid_last_count": 0,
-            "health": {
-                "timeout": float(_dde_health_cache.get("timeout", 30.0) or 30.0),
-                "fused_underlyings": [],
-                "fused_count": 0,
-                "stale_count": 0,
-                "active_count": 0,
-            },
-        }
-
-    feeder = _dde_feeder
-    today = bj_today()
-    with _dde_lock:
-        data = feeder.poll_once()
-        rows = []
-        valid_last = 0
-        for code in sorted(data.keys()):
-            quote = data[code]
-            route = feeder.routes.get(code)
-            last = quote.get("LASTPRICE")
-            if isinstance(last, (float, int)):
-                valid_last += 1
-            is_etf = route and route.option_type == "ETF"
-            strike_val = "" if is_etf else (route.strike if route else "")
-            expiry_str = ""
-            underlying = (route.underlying if route else "").replace(".SH", "").replace(".XSHG", "").strip()
-            if not is_etf:
-                code_bare = code.replace(".SH", "").replace(".XSHG", "").strip()
-                info = wind_info.get(code_bare)
-                if info and info.get("expiry_date"):
-                    expiry_str = info["expiry_date"].strftime("%Y-%m-%d")
-            rows.append(
-                {
-                    "code": code,
-                    "underlying": underlying,
-                    "type": route.option_type if route else "",
-                    "strike": strike_val,
-                    "expiry": expiry_str,
-                    "last": quote.get("LASTPRICE"),
-                    "bid1": quote.get("BIDPRICE1"),
-                    "ask1": quote.get("ASKPRICE1"),
-                    "bidv1": quote.get("BIDVOLUME1"),
-                    "askv1": quote.get("ASKVOLUME1"),
-                }
-            )
-        health = _update_dde_health_from_rows(rows)
-        return {
-            "ok": True,
-            "time": bj_now_naive().strftime("%Y-%m-%d %H:%M:%S"),
-            "route_count": len(feeder.routes),
-            "rows": rows,
-            "valid_last_count": valid_last,
-            "health": health,
-        }
-
-
-@app.get("/api/dde/diag")
-def dde_diag(code: Optional[str] = None, limit: int = 8) -> Dict[str, Any]:
-    """
-    DDE 诊断接口：返回原始值(raw) + 解析值(parsed) + 错误信息(error)。
-    - code: 指定单个合约代码（可选）
-    - limit: 未指定 code 时，最多诊断前 N 条合约
-    """
-    feeder = _require_dde_running()
-    with _dde_lock:
-        request_fields = feeder.client.request_fields
-        selected_codes: list[str]
-        if code:
-            if code not in feeder.routes:
-                raise HTTPException(status_code=404, detail=f"未找到合约: {code}")
-            selected_codes = [code]
-        else:
-            selected_codes = sorted(feeder.routes.keys())[: max(1, min(limit, 50))]
-
-        rows = []
-        total = 0
-        parsed_count = 0
-        error_count = 0
-        for c in selected_codes:
-            route = feeder.routes[c]
-            field_diag: Dict[str, Dict[str, Any]] = {}
-            for field in request_fields:
-                parsed, raw, err, ords = feeder.client.request_diagnostic(route.topic, field)
-                total += 1
-                if err:
-                    error_count += 1
-                if parsed is not None:
-                    parsed_count += 1
-                field_diag[field] = {
-                    "parsed": parsed,
-                    "raw_hex": raw,
-                    "error": err,
-                    "raw_len": len(ords),
-                }
-            rows.append(
-                {
-                    "code": c,
-                    "type": route.option_type,
-                    "topic": route.topic,
-                    "source": route.source_file,
-                    "fields": field_diag,
-                }
-            )
-
-        return {
-            "ok": True,
-            "time": bj_now_naive().strftime("%Y-%m-%d %H:%M:%S"),
-            "route_count": len(feeder.routes),
-            "selected_count": len(selected_codes),
-            "stats": {
-                "total_fields": total,
-                "parsed_fields": parsed_count,
-                "error_fields": error_count,
-            },
-            "rows": rows,
-        }
 
 
 @app.get("/api/state")

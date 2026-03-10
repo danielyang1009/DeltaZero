@@ -27,9 +27,18 @@ python console.py
 
 1. 启动通达信（确保 TdxW DDE Server 已激活）
 2. 确认 `metadata/wxy_options.xlsx` 已就位（含 3 个 Sheet：`50etf` / `300etf` / `500etf`）——DDE topic 地址从此文件解析
-3. 在控制台启动 DDEBus
+3. 在控制台启动 DDEBus（`--source dde`）
 
-> 新版 `data_bus/dde_direct_client.py` 用 pywin32 直连通达信（无需 Excel **运行**），但 topic 地址仍从 `wxy_*.xlsx` 读取。未在路由表中的合约回退到 `{交易所}{代码}` 格式推算。
+> `data_bus/dde_direct_client.py` 用 pywin32 直连通达信（无需 Excel 运行），topic 地址从 `wxy_*.xlsx` 读取，未找到时回退 `{交易所}{代码}` 推算。
+
+### DDE 监控页面（`/dde`）
+
+纯监控视图，读取 market_cache LKV 快照展示实时数据，不提供启停控制。
+
+| API | 说明 |
+|-----|------|
+| `GET /api/dde/state` | DataBus 运行状态 + LKV 合约统计（期权/ETF 数量） |
+| `GET /api/dde/poll` | 完整行情快照，含健康状态（STALE 超时 90s） |
 
 ## 关键命令
 
