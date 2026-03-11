@@ -305,6 +305,8 @@ class PCPArbitrage:
         )
         fwd_per_share = float(metrics["fwd_per_share"] or 0.0)
         fwd_profit = float(metrics["fwd_profit"] or 0.0)
+        if self.config.include_interest and T > 0:
+            fwd_profit -= K * (1 - math.exp(-r * T)) * mult
         fwd_detail    = (
             f"K({K:.3g})-S_a({S_ask:.4f})-P_a({P_ask:.4f})+C_b({C_bid:.4f})"
             f"={fwd_per_share:.4f}/股"

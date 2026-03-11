@@ -34,6 +34,7 @@ _thread: Optional[threading.Thread] = None
 _compute_thread: Optional[threading.Thread] = None
 _event_loop: Optional[asyncio.AbstractEventLoop] = None
 _update_queue: Optional[asyncio.Queue] = None
+_start_time: Optional[float] = None
 
 
 def _try_put(q: asyncio.Queue, item: Any) -> None:
@@ -54,6 +55,25 @@ def get_rich_snapshot() -> Dict[str, Any]:
     """返回最新计算结果浅拷贝（WS 广播兜底用）。"""
     with _rich_lkv_lock:
         return dict(_rich_lkv)
+
+
+def get_status() -> Dict[str, Any]:
+    """返回 market_cache 线程运行状态，供 /api/state 展示。"""
+    zmq_alive     = _thread is not None and _thread.is_alive()
+    compute_alive = _compute_thread is not None and _compute_thread.is_alive()
+    uptime: Optional[str] = None
+    if _start_time is not None:
+        sec = int(max(time.time() - _start_time, 0))
+        h, rem = divmod(sec, 3600)
+        m, s   = divmod(rem, 60)
+        uptime = f"{h}h{m:02d}m" if h > 0 else (f"{m}m{s:02d}s" if m > 0 else f"{s}s")
+    return {
+        "running": _running and zmq_alive and compute_alive,
+        "zmq_alive": zmq_alive,
+        "compute_alive": compute_alive,
+        "uptime": uptime or "-",
+        "lkv_count": len(_lkv),
+    }
 
 
 def _restore_from_parquet(snapshot_path: Path) -> int:
@@ -234,8 +254,8 @@ def _compute_loop() -> None:
             spot_raw = etf_rec.get("last")
             spot = float(spot_raw) if spot_raw is not None else float("nan")
 
-            # 按到期日分组
-            expiry_map: Dict = defaultdict(lambda: {"calls": {}, "puts": {}})
+            # 按 (到期日, is_adjusted) 分组，避免标准/调整合约行权价互相覆盖
+            expiry_adj_map: Dict = defaultdict(lambda: {"calls": {}, "puts": {}})
             for code, info in catalog.items():
                 if info.underlying_code != underlying:
                     continue
@@ -251,12 +271,14 @@ def _compute_loop() -> None:
                     continue
                 mid = (b + a) / 2.0
                 key = "calls" if info.option_type == OptionType.CALL else "puts"
-                expiry_map[info.expiry_date][key][info.strike_price] = {
+                is_adj = (getattr(info, "contract_unit", 10000) != 10000)
+                expiry_adj_map[(info.expiry_date, is_adj)][key][info.strike_price] = {
                     "code": code, "mid": mid, "bid": b, "ask": a,
                 }
 
-            expiry_results: Dict[str, Any] = {}
-            for expiry_date, grp in expiry_map.items():
+            expiries_std: Dict[str, Any] = {}
+            expiries_adj: Dict[str, Any] = {}
+            for (expiry_date, is_adj), grp in expiry_adj_map.items():
                 calls, puts = grp["calls"], grp["puts"]
 
                 # ── [GUARD-3] T 毫秒级动态对齐 ─────────────
@@ -322,16 +344,19 @@ def _compute_loop() -> None:
                             "pcp_dev": pcp_dev, "iv_skew": iv_skew,
                         })
 
-                expiry_results[expiry_date.strftime("%Y-%m-%d")] = {
+                entry = {
                     "F": round(F, 6), "T_days": round(T * 365.25, 4),
                     "r": round(r, 6), "atm_strike": K_atm,
                     "contracts": contracts_out,
                 }
+                key_str = expiry_date.strftime("%Y-%m-%d")
+                (expiries_adj if is_adj else expiries_std)[key_str] = entry
 
             result[underlying] = {
                 "spot": round(spot, 6) if not math.isnan(spot) else None,
                 "ts": int(now_ts * 1000),
-                "expiries": expiry_results,
+                "expiries": expiries_std,
+                "adj_expiries": expiries_adj,
             }
 
         # ── 写入 _rich_lkv（HTTP 兜底用）────────────────
@@ -365,6 +390,7 @@ def start(
     _event_loop   = event_loop
     _update_queue = update_queue
     _running = True
+    _start_time = time.time()
 
     _thread = threading.Thread(
         target=_zmq_loop,

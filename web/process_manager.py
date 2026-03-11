@@ -8,7 +8,7 @@ from typing import Any, Dict, List
 
 import psutil
 
-from config.settings import DEFAULT_MARKET_DATA_DIR
+from config.settings import DEFAULT_MARKET_DATA_DIR, DEFAULT_MIN_PROFIT, DEFAULT_EXPIRY_DAYS, DEFAULT_N_EACH_SIDE, DEFAULT_REFRESH_SECS
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
@@ -138,9 +138,9 @@ def process_info(proc: psutil.Process, kind: str) -> Dict[str, Any]:
             f"persist={persist}"
         )
     elif kind == "monitor":
-        mp = arg_from_cmd(cmd, "--min-profit", "30")
-        ed = arg_from_cmd(cmd, "--expiry-days", "90")
-        nes = arg_from_cmd(cmd, "--n-each-side", "10")
+        mp = arg_from_cmd(cmd, "--min-profit", str(DEFAULT_MIN_PROFIT))
+        ed = arg_from_cmd(cmd, "--expiry-days", str(DEFAULT_EXPIRY_DAYS))
+        nes = arg_from_cmd(cmd, "--n-each-side", str(DEFAULT_N_EACH_SIDE))
         params = f"source=zmq profit≥{mp} expiry≤{ed}d ATM上下各{nes}组"
         restart_args = [
             "--min-profit",
@@ -148,9 +148,9 @@ def process_info(proc: psutil.Process, kind: str) -> Dict[str, Any]:
             "--expiry-days",
             ed,
             "--refresh",
-            arg_from_cmd(cmd, "--refresh", "3"),
+            arg_from_cmd(cmd, "--refresh", str(DEFAULT_REFRESH_SECS)),
             "--n-each-side",
-            arg_from_cmd(cmd, "--n-each-side", "10"),
+            nes,
             "--zmq-port",
             arg_from_cmd(cmd, "--zmq-port", "5555"),
             "--snapshot-dir",
@@ -170,4 +170,16 @@ def spawn_module(module: str, args: List[str]) -> Dict[str, Any]:
     flags = subprocess.CREATE_NEW_CONSOLE if sys.platform == "win32" else 0
     proc = subprocess.Popen(cmd, cwd=str(PROJECT_ROOT), creationflags=flags)
     return {"pid": proc.pid}
+
+
+def spawn_module_captured(module: str, args: List[str]) -> subprocess.Popen:
+    """启动子进程并捕获 stdout+stderr（不弹新控制台窗口）。"""
+    cmd = [sys.executable, "-u", "-m", module] + args
+    env = {**__import__("os").environ, "PYTHONUNBUFFERED": "1"}
+    return subprocess.Popen(
+        cmd, cwd=str(PROJECT_ROOT),
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, bufsize=1, encoding="utf-8", errors="replace",
+        env=env,
+    )
 

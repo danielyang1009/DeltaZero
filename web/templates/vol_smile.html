@@ -74,7 +74,7 @@ h1{margin:0 0 12px;font-size:20px}
   <div id="statusBar">—</div>
 </div>
 
-<div class="table-card">
+<div class="table-card" style="margin-bottom:12px">
   <table id="ivTable">
     <thead>
       <tr>
@@ -89,6 +89,31 @@ h1{margin:0 0 12px;font-size:20px}
     </thead>
     <tbody id="ivTableBody"></tbody>
   </table>
+</div>
+
+<div style="margin-top:0;background:#fff;border:1px solid #dde1ea;border-radius:10px;padding:14px 18px;font-size:12px;color:#475569;line-height:1.9">
+  <div style="font-weight:700;margin-bottom:8px;color:#1e293b">说明</div>
+
+  <div style="margin-bottom:10px">
+    <span style="font-weight:600;color:#1e293b">行颜色</span><br>
+    <span style="display:inline-block;width:14px;height:14px;background:#eff6ff;border:1px solid #bfdbfe;border-radius:2px;vertical-align:middle;margin-right:4px"></span>蓝色：该行权价为当前 ATM（最接近平值，由隐含远期价 F 判断）<br>
+    <span style="display:inline-block;width:14px;height:14px;background:#fef9c3;border:1px solid #fde68a;border-radius:2px;vertical-align:middle;margin-right:4px"></span>黄色：PCP 偏差绝对值超过阈值，该行权价存在 Call/Put 相对定价偏差<br>
+    <span style="display:inline-block;width:14px;height:14px;background:#fee2e2;border:1px solid #fecaca;border-radius:2px;vertical-align:middle;margin-right:4px"></span>红色：IV Skew 绝对值超过阈值，该行权价 Call 与 Put 隐含波动率差异过大
+  </div>
+
+  <div style="margin-bottom:10px">
+    <span style="font-weight:600;color:#1e293b">PCP 偏差（Put-Call Parity Deviation）</span><br>
+    公式：<code style="background:#f1f5f9;padding:1px 5px;border-radius:3px">PCP偏差 = C_mid + K·e<sup>−rT</sup> − P_mid − F·e<sup>−rT</sup></code><br>
+    其中 F 为由 ATM 行权价反推的隐含远期价，r 为无风险利率，T 为到期时间（年）。<br>
+    结果接近 0 表示无套利定价成立；正值表示 Call 相对 Put 偏贵，负值表示 Put 相对 Call 偏贵。
+  </div>
+
+  <div>
+    <span style="font-weight:600;color:#1e293b">IV Skew（C − P）</span><br>
+    公式：<code style="background:#f1f5f9;padding:1px 5px;border-radius:3px">IV Skew = IV(Call) − IV(Put)</code>（同一行权价）<br>
+    在 Black-76 框架下，相同远期价对应的 Call 与 Put 隐含波动率理论上相等。<br>
+    非零值通常来源于买卖价差（流动性差异）或市场对上下方风险的非对称定价（波动率偏斜）。
+  </div>
 </div>
 
 <script>
@@ -318,20 +343,32 @@ function doRender() {
   const ul = msg.data[underlying];
   if (!ul) return;
 
-  // 同步到期日列表
-  const newExpiries = Object.keys(ul.expiries || {}).sort();
+  const stdExpiries = ul.expiries || {};
+  const adjExpiries = ul.adj_expiries || {};
+
+  // 到期日下拉框始终以标准合约为基准
+  const newExpiries = Object.keys(stdExpiries).sort();
   if (JSON.stringify(newExpiries) !== JSON.stringify(_allExpiries)) {
     _allExpiries = newExpiries;
-    const curExpiry = selExpiry.value;
+    const prev = selExpiry.value;
     selExpiry.innerHTML = newExpiries.map(e => `<option value="${e}">${e}</option>`).join('');
-    if (newExpiries.includes(curExpiry)) selExpiry.value = curExpiry;
+    if (newExpiries.includes(prev)) selExpiry.value = prev;
     else _prevTable = {};
   }
 
   const curExpiry = selExpiry.value;
-  if (!curExpiry || !ul.expiries[curExpiry]) return;
+  if (!curExpiry) return;
 
-  const ed = ul.expiries[curExpiry];
+  // "调整合约"选项：仅当前选中到期日有调整合约时才可选
+  const curHasAdj = !!adjExpiries[curExpiry];
+  const adjOpt = selAdjusted.querySelector('option[value="true"]');
+  if (adjOpt) { adjOpt.hidden = !curHasAdj; adjOpt.disabled = !curHasAdj; }
+  if (!curHasAdj && selAdjusted.value === 'true') selAdjusted.value = 'false';
+
+  const expiriesObj = (selAdjusted.value === 'true') ? adjExpiries : stdExpiries;
+  if (!expiriesObj[curExpiry]) return;
+
+  const ed = expiriesObj[curExpiry];
   updateChart(ed, ul.spot);
   updateTableFull(ed, ed.atm_strike);
 
@@ -384,6 +421,7 @@ async function loadExpiries() {
       selExpiry.innerHTML = '<option value="">暂无数据</option>';
       return;
     }
+    _allExpiries = stdExpiries;
     selExpiry.innerHTML = stdExpiries.map(e => `<option value="${e}">${e}</option>`).join('');
   } catch(e) {
     selExpiry.innerHTML = '<option value="">加载失败</option>';

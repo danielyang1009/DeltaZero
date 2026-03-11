@@ -186,17 +186,22 @@ class DDERouteParser:
     def parse(self) -> Dict[str, str]:
         """解析全部 Excel，并返回 contract_code -> topic。"""
         merged: Dict[str, RouteEntry] = {}
-        seen_paths: set = set()
+
+        # 按文件路径分组：同一文件映射多个品种时（合并文件模式），只解析一次
+        # 并让各 sheet 自行检测对应标的，而非沿用第一个品种代码
+        file_to_assets: Dict[str, List[str]] = {}
         for asset, file_path in self.excel_files.items():
-            if file_path in seen_paths:
-                continue
-            seen_paths.add(file_path)
+            file_to_assets.setdefault(str(file_path), []).append(asset)
+
+        for file_path, assets in file_to_assets.items():
             path = Path(file_path)
             if not path.exists():
-                self.logger.warning("映射文件不存在，跳过: %s (%s)", path, asset)
+                self.logger.warning("映射文件不存在，跳过: %s (%s)", path, assets)
                 continue
 
-            entries = self._parse_single_file(path, underlying=asset)
+            # 单品种文件：传入 underlying 作为 hint；合并文件：传 "" 让 sheet 自检
+            hint = assets[0] if len(assets) == 1 else ""
+            entries = self._parse_single_file(path, underlying=hint)
             for code, entry in entries.items():
                 if code in merged and merged[code].topic != entry.topic:
                     self.logger.warning(
@@ -335,6 +340,16 @@ class DDERouteParser:
         routes: Dict[str, RouteEntry] = {}
         source_tag = f"{source_name}#{sheet_name}"
 
+        # 若未传入 underlying（合并文件模式），预扫描 ETF 行自动检测本 sheet 的标的代码
+        sheet_underlying = underlying
+        if not sheet_underlying:
+            for row in rows[1:]:
+                cell_map = self._row_to_cell_map(row, shared_strings)
+                etf_code_raw = self._safe_text(cell_map, self._ETF_CODE_COL)
+                if etf_code_raw and etf_code_raw.isdigit():
+                    sheet_underlying = self._normalize_underlying_code(etf_code_raw)
+                    break
+
         for row in rows[1:]:  # 跳过标题行
             cell_map = self._row_to_cell_map(row, shared_strings)
             if not cell_map:
@@ -358,7 +373,7 @@ class DDERouteParser:
                         option_type="CALL",
                         strike=strike,
                         source_file=source_tag,
-                        underlying=underlying,
+                        underlying=sheet_underlying,
                     )
                 if put_code and put_server and put_topic:
                     routes[put_code] = RouteEntry(
@@ -368,7 +383,7 @@ class DDERouteParser:
                         option_type="PUT",
                         strike=strike,
                         source_file=source_tag,
-                        underlying=underlying,
+                        underlying=sheet_underlying,
                     )
                 continue
 
@@ -388,7 +403,7 @@ class DDERouteParser:
                     option_type="ETF",
                     strike=strike,
                     source_file=source_tag,
-                    underlying=underlying or etf_code,
+                    underlying=sheet_underlying or etf_code,
                 )
         return routes
 

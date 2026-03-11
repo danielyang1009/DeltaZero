@@ -157,6 +157,13 @@ Monitor 每行除净利润外，还展示以下辅助指标，用于判断能否
 
 不使用仓库根目录存储运行数据。
 
+## 最近变更
+
+- **DataBus 独立运行**：通过 `CREATE_NEW_CONSOLE` 在独立窗口启动，关闭控制台不影响 DataBus 继续落盘；移除控制台内的日志流面板
+- **Vol Smile 标准/调整合约分离**：`market_cache` 按 `(expiry_date, is_adjusted)` 双键分组，WS 推送新增 `adj_expiries` 字段；前端"调整合约"选项按当前选中到期日动态显隐
+- **进程总览新增 VolSmile 计算条目**：实时显示 LKV 数量与 zmq/compute 线程状态（内置线程，无关闭按钮）
+- **Monitor 参数集中管理**：`config/settings.py` 新增 `DEFAULT_MIN_PROFIT=36`、`DEFAULT_EXPIRY_DAYS=90`、`DEFAULT_N_EACH_SIDE=0`、`DEFAULT_REFRESH_SECS=3`；控制台通过 `/api/state` 下发默认值，输入框自动填充，修改参数只需改 `settings.py` 一处
+
 ## 波动率微笑（Vol Smile）
 
 访问 `http://127.0.0.1:8787/vol_smile`，实时展示 50ETF / 300ETF / 500ETF 期权的隐含波动率微笑曲线与 IV 数据表格。

@@ -125,7 +125,8 @@ class DDESubscriber(DataProvider):
         self._thread = threading.Thread(target=target, name="dde-subscriber", daemon=True)
         self._thread.start()
         # 等待轮询线程完成 DDE 初始化（DDE 连接需与请求在同线程）
-        self._startup_done.wait(timeout=10.0)
+        # 231 路由 + 1155 热链接注册约需 10~20s，给足 60s 裕量
+        self._startup_done.wait(timeout=60.0)
         if not self._startup_ok:
             self._is_running = False
             if self._thread and self._thread.is_alive():

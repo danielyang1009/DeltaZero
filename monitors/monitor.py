@@ -44,7 +44,7 @@ from monitors.common import (
     restore_from_snapshot,
     select_pairs_by_atm,
 )
-from config.settings import DEFAULT_MARKET_DATA_DIR, UNDERLYINGS
+from config.settings import DEFAULT_MARKET_DATA_DIR, DEFAULT_MIN_PROFIT, DEFAULT_EXPIRY_DAYS, DEFAULT_N_EACH_SIDE, DEFAULT_REFRESH_SECS, UNDERLYINGS
 from models import (
     ContractInfo,
     ETFTickData,
@@ -201,7 +201,7 @@ def _build_etf_table(
 
     if not display_pairs_u:
         tbl = _make_table(show_header=True)
-        tbl.add_row(*["—"] * 13)
+        tbl.add_row("—", "", *["—"] * 11)
         return Panel(tbl, title=panel_title, subtitle=panel_subtitle,
                      border_style=border, expand=True, padding=(0, 0))
 
@@ -251,7 +251,7 @@ def _build_etf_table(
                 strike_str = f"{strike:.2f}{adj_tag}"
                 if is_atm:
                     strike_str = f"[yellow]{strike_str}[/yellow]"
-                data_tbl.add_row(strike_str, *["--"] * 12)
+                data_tbl.add_row(strike_str, "", *["--"] * 11)
         renderables.append(data_tbl)
 
     return Panel(
@@ -323,14 +323,15 @@ def build_display(
 # ──────────────────────────────────────────────────────────────────────
 
 def run_monitor(
-    min_profit: float = 30.0,
-    expiry_days: int = 90,
-    refresh_secs: int = 3,
-    n_each_side: int = 10,
+    min_profit: float = DEFAULT_MIN_PROFIT,
+    expiry_days: int = DEFAULT_EXPIRY_DAYS,
+    refresh_secs: int = DEFAULT_REFRESH_SECS,
+    n_each_side: int = DEFAULT_N_EACH_SIDE,
     zmq_port: int = 5555,
     snapshot_dir: str = DEFAULT_MARKET_DATA_DIR,
     etf_fee_rate: float = 0.0002,
     option_one_side_fee: float = 1.5,
+    include_interest: bool = False,
 ) -> None:
     """ZMQ 订阅模式监控：从 data_bus 进程接收实时行情。"""
     try:
@@ -348,6 +349,7 @@ def run_monitor(
     tmp_config.min_profit_threshold = min_profit
     tmp_config.etf_fee_rate = etf_fee_rate
     tmp_config.option_round_trip_fee = option_one_side_fee * 2
+    tmp_config.include_interest = include_interest
     tmp_strategy = PCPArbitrage(tmp_config)
     n_snap = restore_from_snapshot(tmp_strategy, snapshot_dir, etf_prices)
     if n_snap:
@@ -361,6 +363,7 @@ def run_monitor(
                 min_profit, expiry_days, 1.0, etf_prices,  # 1.0=全量配对，显示由 n_each_side 控制
                 etf_fee_rate=etf_fee_rate,
                 option_round_trip_fee=option_one_side_fee * 2,
+                include_interest=include_interest,
                 log_fn=lambda msg: console.print(msg),
             )
         )
@@ -535,14 +538,15 @@ def parse_args() -> argparse.Namespace:
   python monitor.py --zmq-port 5556
 """,
     )
-    parser.add_argument("--min-profit", type=float, default=30.0, help="最小显示净利润（元/组）")
-    parser.add_argument("--expiry-days", type=int, default=90, help="最大到期天数")
-    parser.add_argument("--refresh", type=int, default=3, help="刷新间隔（秒），收到新数据会立即刷新")
-    parser.add_argument("--n-each-side", type=int, default=10, help="ATM 上下各显示 N 组（0=显示全部）")
+    parser.add_argument("--min-profit", type=float, default=DEFAULT_MIN_PROFIT, help="最小显示净利润（元/组）")
+    parser.add_argument("--expiry-days", type=int, default=DEFAULT_EXPIRY_DAYS, help="最大到期天数")
+    parser.add_argument("--refresh", type=int, default=DEFAULT_REFRESH_SECS, help="刷新间隔（秒），收到新数据会立即刷新")
+    parser.add_argument("--n-each-side", type=int, default=DEFAULT_N_EACH_SIDE, help="ATM 上下各显示 N 组（0=显示全部）")
     parser.add_argument("--zmq-port", type=int, default=5555, help="ZMQ PUB 端口")
     parser.add_argument("--snapshot-dir", type=str, default=DEFAULT_MARKET_DATA_DIR, help="快照文件目录")
     parser.add_argument("--etf-fee-rate", type=float, default=0.0002, help="ETF 单边手续费率（默认 0.0002 即万2）")
     parser.add_argument("--option-one-side-fee", type=float, default=1.5, help="期权单边手续费（元/张，默认 1.5）")
+    parser.add_argument("--include-interest", action="store_true", help="计入持有到期利息成本（K×(1-e^(-rT))×mult）")
     return parser.parse_args()
 
 
@@ -557,4 +561,5 @@ if __name__ == "__main__":
         snapshot_dir=args.snapshot_dir,
         etf_fee_rate=args.etf_fee_rate,
         option_one_side_fee=args.option_one_side_fee,
+        include_interest=args.include_interest,
     )

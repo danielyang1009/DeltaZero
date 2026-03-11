@@ -19,8 +19,8 @@ from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
-from config.settings import DEFAULT_MARKET_DATA_DIR
-from web.market_cache import get_snapshot, get_rich_snapshot, start as start_market_cache, stop as stop_market_cache
+from config.settings import DEFAULT_MARKET_DATA_DIR, DEFAULT_MIN_PROFIT, DEFAULT_EXPIRY_DAYS, DEFAULT_N_EACH_SIDE, DEFAULT_REFRESH_SECS
+from web.market_cache import get_snapshot, get_rich_snapshot, get_status as get_market_cache_status, start as start_market_cache, stop as stop_market_cache
 from web.data_stats import (
     chunks_readable,
     count_today_chunks,
@@ -52,14 +52,15 @@ app = FastAPI(title="DeltaZero Web Console", version="0.3.0")
 
 _ws_clients: set = set()
 _update_queue: Optional[asyncio.Queue] = None
+_event_loop: Optional[asyncio.AbstractEventLoop] = None
 
 
 @app.on_event("startup")
 async def _startup() -> None:
-    global _update_queue
+    global _update_queue, _event_loop
+    _event_loop = asyncio.get_running_loop()
     _update_queue = asyncio.Queue(maxsize=2)   # maxsize=2 防堆积，旧数据自动丢弃
-    loop = asyncio.get_running_loop()
-    start_market_cache(event_loop=loop, update_queue=_update_queue)
+    start_market_cache(event_loop=_event_loop, update_queue=_update_queue)
     asyncio.create_task(_ws_broadcaster())
 
 
@@ -85,6 +86,7 @@ async def _ws_broadcaster() -> None:
             except Exception:
                 dead.add(ws)
         _ws_clients.difference_update(dead)
+
 
 
 @app.websocket("/ws/vol_smile")
@@ -371,14 +373,15 @@ def _update_dde_health_from_rows(rows: list[Dict[str, Any]]) -> Dict[str, Any]:
 
 
 class MonitorStartRequest(BaseModel):
-    min_profit: float = 30.0
-    expiry_days: int = 90
-    refresh: int = 3
-    n_each_side: int = 10
+    min_profit: float = DEFAULT_MIN_PROFIT
+    expiry_days: int = DEFAULT_EXPIRY_DAYS
+    refresh: int = DEFAULT_REFRESH_SECS
+    n_each_side: int = DEFAULT_N_EACH_SIDE
     zmq_port: int = 5555
     snapshot_dir: str = DEFAULT_MARKET_DATA_DIR
     etf_fee_rate: float = 0.0002
     option_one_side_fee: float = 1.5
+    include_interest: bool = False
 
 
 class RecorderStartRequest(BaseModel):
@@ -388,10 +391,10 @@ class RecorderStartRequest(BaseModel):
 
 class DDEPipelineStartRequest(BaseModel):
     zmq_port: int = 5555
-    refresh: int = 3
-    min_profit: float = 30.0
-    expiry_days: int = 90
-    n_each_side: int = 10
+    refresh: int = DEFAULT_REFRESH_SECS
+    min_profit: float = DEFAULT_MIN_PROFIT
+    expiry_days: int = DEFAULT_EXPIRY_DAYS
+    n_each_side: int = DEFAULT_N_EACH_SIDE
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -493,6 +496,15 @@ def get_state() -> Dict[str, Any]:
     rec_procs = find_recorder_processes()
     mon_procs = find_monitor_processes()
     all_procs = [process_info(p, "databus") for p in rec_procs] + [process_info(p, "monitor") for p in mon_procs]
+    mc = get_market_cache_status()
+    if mc["running"]:
+        all_procs.append({
+            "pid": None,
+            "kind": "vol_smile",
+            "uptime": mc["uptime"],
+            "params": f"lkv:{mc['lkv_count']} zmq:{'✓' if mc['zmq_alive'] else '✗'} compute:{'✓' if mc['compute_alive'] else '✗'}",
+            "restart_args": [],
+        })
     snapshot_raw = read_snapshot_stats(DEFAULT_MARKET_DATA_DIR)
     chunks_raw = count_today_chunks(DEFAULT_MARKET_DATA_DIR)
     merge_status = merge_status_readable(DEFAULT_MARKET_DATA_DIR, bj_today())
@@ -512,18 +524,24 @@ def get_state() -> Dict[str, Any]:
         },
         "bond_files": _bond_files_info(),
         "vol_smile_active_ago": _mtime_ago_str(_vol_smile_last_active) if _vol_smile_last_active else None,
+        "default_min_profit": DEFAULT_MIN_PROFIT,
+        "default_expiry_days": DEFAULT_EXPIRY_DAYS,
+        "default_n_each_side": DEFAULT_N_EACH_SIDE,
+        "default_refresh_secs": DEFAULT_REFRESH_SECS,
     }
 
 
 @app.post("/api/processes/recorder/start")
 def start_recorder(req: RecorderStartRequest) -> Dict[str, Any]:
+    global _databus_proc_ref
     existing = find_recorder_processes()
     if existing:
         raise HTTPException(status_code=409, detail=f"DataBus 已在运行 (PID {existing[0].pid})，请先关闭")
     if req.source == "dde":
         _ensure_infinitrader_running()
     args = ["--source", req.source, "--port", str(req.zmq_port)]
-    return {"ok": True, "started": spawn_module("data_bus.bus", args)}
+    started = spawn_module("data_bus.bus", args)
+    return {"ok": True, "started": started}
 
 
 @app.post("/api/processes/monitor/start")
@@ -538,6 +556,8 @@ def start_monitor(req: MonitorStartRequest) -> Dict[str, Any]:
         "--etf-fee-rate", str(req.etf_fee_rate),
         "--option-one-side-fee", str(req.option_one_side_fee),
     ]
+    if req.include_interest:
+        args.append("--include-interest")
     return {"ok": True, "started": spawn_module("monitors.monitor", args)}
 
 

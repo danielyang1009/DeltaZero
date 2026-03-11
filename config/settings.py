@@ -25,6 +25,12 @@ ETF_CODE_TO_NAME: Dict[str, str] = {
 
 DEFAULT_MARKET_DATA_DIR = r"D:\MARKET_DATA"
 
+# Monitor 显示参数默认值（web 控制台启动面板的初始值，用户可在页面修改）
+DEFAULT_MIN_PROFIT   = 36.0   # 净利润显示门槛（元/组）
+DEFAULT_EXPIRY_DAYS  = 90     # 最大到期天数
+DEFAULT_N_EACH_SIDE  = 0      # ATM 上下各显示 N 组（0 = 全部）
+DEFAULT_REFRESH_SECS = 3      # 刷新间隔（秒）
+
 
 @dataclass
 class FeeConfig:
@@ -107,6 +113,7 @@ class TradingConfig:
     # PCP 套利成本参数（实时监控简化公式，见 pcp_arbitrage.py 说明）
     etf_fee_rate: float = 0.00020                  # ETF 现货单边规费（含佣金+过户费，约万2）
     option_round_trip_fee: float = 3.0             # 期权双边固定手续费（≈ fee.option_commission_per_contract × 2 取整）
+    include_interest: bool = False                 # 是否计入持有到期利息成本（K×(1-e^(-rT))×mult）
 
     # ETF 模拟器参数
     simulation_volatility: float = 0.20            # 模拟波动率
