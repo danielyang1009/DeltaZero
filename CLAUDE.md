@@ -32,13 +32,18 @@ python -m backtest.run
 ## 架构：四层流水线
 
 ```
-数据源（Wind API / DDE）
+【第 1 层】数据采集层
+  数据源（Wind API / DDE）
        ↓
-data_bus/bus.py          — ZMQ PUB（tcp://127.0.0.1:5555）+ 可选 Parquet 落盘
+【第 2 层】数据总线层
+  data_bus/bus.py          — ZMQ PUB（tcp://127.0.0.1:5555）+ 可选 Parquet 落盘
        ↓
-monitors/monitor.py      — ZMQ SUB，Rich 终端 UI 实时刷新
-web/market_cache.py      — ZMQ SUB（CONFLATE=1）→ LKV 快照 → compute 线程向量化计算
-web/dashboard.py         — FastAPI 控制台 + WebSocket /ws/vol_smile 推送
+【第 3 层】消费层（ZMQ SUB）
+  monitors/monitor.py      — Rich 终端 UI 实时刷新（PCP 套利信号）
+  web/market_cache.py      — CONFLATE=1 → LKV 快照 → compute 线程向量化 IV
+       ↓
+【第 4 层】展示层
+  web/dashboard.py         — FastAPI 控制台 + WebSocket /ws/vol_smile 推送
 ```
 
 **DataBus（`data_bus/bus.py`）**：消费来自 `WindSubscriber` 或 `DDESubscriber` 的 tick，写入 Parquet 分片（`D:\MARKET_DATA\chunks\`），同时通过 `ZMQPublisher` 广播 `OPT_` / `ETF_` 前缀消息。每 30 秒刷盘，15:10 自动触发日终合并为 `options_YYYYMMDD.parquet` / `etf_YYYYMMDD.parquet`，并维护 `snapshot_latest.parquet` 供 Monitor 冷启动恢复。

@@ -1,10 +1,28 @@
 # DeltaZero
 
-ETF 期权 PCP 套利工具，采用四层结构：
-- 数据采集层：Wind / DDE（纯 Python 直连，无需 Excel）
-- 数据总线层：`data_bus`
-- 消费层：`monitor`（ZMQ）、`web`（FastAPI + WebSocket）
-- 计算层：向量化 Black-76 IV 求解器
+ETF 期权 PCP 套利工具，采用四层流水线结构：
+
+```
+【第 1 层】数据采集层
+  数据源（Wind API / DDE）
+       ↓
+【第 2 层】数据总线层
+  data_bus/bus.py          — ZMQ PUB（tcp://127.0.0.1:5555）+ 可选 Parquet 落盘
+       ↓
+【第 3 层】消费层（ZMQ SUB）
+  monitors/monitor.py      — Rich 终端 UI 实时刷新（PCP 套利信号）
+  web/market_cache.py      — CONFLATE=1 → LKV 快照 → compute 线程向量化 IV
+       ↓
+【第 4 层】展示层
+  web/dashboard.py         — FastAPI 控制台 + WebSocket /ws/vol_smile 推送
+```
+
+| 层 | 模块 | 说明 |
+|----|------|------|
+| 数据采集 | `data_bus/bus.py` | 消费 `WindSubscriber` 或 `DDESubscriber` 的 tick，写 Parquet 分片，同时 ZMQ PUB 广播 |
+| 数据总线 | ZMQ PUB 5555 | 统一消息格式：`OPT_` / `ETF_` 前缀；每 30 秒刷盘，15:10 自动日终合并 |
+| 消费层 | `monitors/monitor.py` | ZMQ SUB → `PCPArbitrage.scan_pairs_for_display()` → Rich 终端表格 |
+| 消费层 | `web/market_cache.py` | ZMQ SUB（CONFLATE=1）→ LKV → 每 100ms 向量化 IV → asyncio Queue → WS 推送 |
 
 ## 快速启动
 
@@ -207,6 +225,30 @@ DDEDirectSubscriber._on_tick() → tick_queue → DataBus ZMQ PUB
 ### 为什么 topic 不能推算
 
 topic 是行情软件内部的不透明数字字符串（如 `"2206355670"`），软件升级后可能改变，**只能从 `metadata/wxy_options.xlsx` 的 externalLink XML 中读取**，禁止用代码规则推算。
+
+### wxy_options.xlsx 解析细节
+
+xlsx 是 ZIP，`_load_topic_map()` 解析其中的 `xl/externalLinks/externalLink*.xml`：
+
+| 字段 | XML 属性 | 实际值 |
+|------|----------|--------|
+| service | `ddeService` | `"QD"`（不是 `"TdxW"`，写错则全部连接失败） |
+| topic | `ddeTopic` | 每个合约对应一个不透明数字（如 `"2206355670"`） |
+| item | 列名 | `LASTPRICE`、`BIDPRICE1`、`ASKPRICE1`、`BIDVOLUME1`、`ASKVOLUME1` |
+
+`_load_topic_map()` 在 DataBus 启动时读取一次，返回 `(code→topic dict, service_name)`。
+
+### 禁止事项
+
+- **禁止用 `pywin32 dde` 模块替换**：`ConnectTo()` 对 QD 服务连接必定失败，只有 ctypes DDEML 可用
+- **禁止将 DDE 操作改为异步或多线程并发**：`DdeConnect` 依赖 Windows 消息泵，必须在单一线程内串行调用并在每次 connect 后立即 `_pump_messages()`
+- **禁止从代码推算 service/topic**：所有地址信息来自 xlsx，软件升级后地址可能改变
+
+### DDE 测试流程
+
+1. 确认 `metadata/wxy_options.xlsx` 已放入 `metadata/`
+2. 启动 DataBus：`python -m data_bus.bus --source dde`
+3. 30 秒后查看自检日志：`DDE 自检(30s): 累计=N tick, 期权标的=[...]`
 
 ---
 
