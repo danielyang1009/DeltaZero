@@ -11,7 +11,7 @@ ETF 期权 PCP 套利工具，采用四层流水线结构：
        ↓
 【第 3 层】消费层（ZMQ SUB）
   monitors/monitor.py      — Rich 终端 UI 实时刷新（PCP 套利信号）
-  web/market_cache.py      — CONFLATE=1 → LKV 快照 → compute 线程向量化 IV
+  web/market_cache.py      — CONFLATE=1 → LKV 快照 → compute 线程 Brent 法 IV
        ↓
 【第 4 层】展示层
   web/dashboard.py         — FastAPI 控制台 + WebSocket /ws/vol_smile 推送
@@ -19,10 +19,10 @@ ETF 期权 PCP 套利工具，采用四层流水线结构：
 
 | 层 | 模块 | 说明 |
 |----|------|------|
-| 数据采集 | `data_bus/bus.py` | 消费 `WindSubscriber` 或 `DDESubscriber` 的 tick，写 Parquet 分片，同时 ZMQ PUB 广播 |
+| 数据采集 | `data_bus/bus.py` | 消费 `WindSubscriber` 或 `DDEDirectSubscriber` 的 tick，写 Parquet 分片，同时 ZMQ PUB 广播 |
 | 数据总线 | ZMQ PUB 5555 | 统一消息格式：`OPT_` / `ETF_` 前缀；每 30 秒刷盘，15:10 自动日终合并 |
 | 消费层 | `monitors/monitor.py` | ZMQ SUB → `PCPArbitrage.scan_pairs_for_display()` → Rich 终端表格 |
-| 消费层 | `web/market_cache.py` | ZMQ SUB（CONFLATE=1）→ LKV → 每 100ms 向量化 IV → asyncio Queue → WS 推送 |
+| 消费层 | `web/market_cache.py` | ZMQ SUB（CONFLATE=1）→ LKV → 每 100ms Brent 法 IV → asyncio Queue → WS 推送 |
 
 ## 快速启动
 
@@ -43,11 +43,11 @@ python console.py
 
 ### DDE 启动前置步骤
 
-1. 启动通达信（确保 TdxW DDE Server 已激活）
+1. 启动行情软件（确保 QD DDE 服务已激活）
 2. 确认 `metadata/wxy_options.xlsx` 已就位（含 3 个 Sheet：`50etf` / `300etf` / `500etf`）——DDE topic 地址从此文件解析
 3. 在控制台启动 DDEBus（`--source dde`）
 
-> `data_bus/dde_direct_client.py` 用 ctypes DDEML 直连通达信（无需 Excel 运行），service/topic 地址**仅**来自 `wxy_*.xlsx`，无对应 topic 的合约直接跳过。
+> `data_bus/dde_direct_client.py` 用 ctypes DDEML 直连行情软件（无需 Excel 运行），service=`"QD"`，topic 地址**仅**来自 `wxy_options.xlsx`，无对应 topic 的合约直接跳过。
 
 ### DDE 监控页面（`/dde`）
 
@@ -86,15 +86,14 @@ python -m monitors.monitor --zmq-port 5555
 - `data_engine.contract_catalog`
 - `data_engine.tick_data_loader`
 - `data_engine.bar_data_loader`
-- `data_engine.dde_adapter`
-- `data_bus.dde_direct_client`：纯 Python DDE 直连通达信（ctypes DDEML，Excel 无需运行，topic 来自 `wxy_*.xlsx`）
+- `data_bus.dde_direct_client`：纯 Python DDE 直连行情软件（ctypes DDEML，Excel 无需运行，topic 来自 `wxy_options.xlsx`）
 - `calculators.vectorized_pricer`：Black-76 IV 求解器（Brent 法，GUARD-1/2/3）
 - `backtest.etf_price_simulator`
 
 ## 数据目录约定
 
-- DDE 路由表（旧版）：`metadata/wxy_options.xlsx`，含 3 个 Sheet（`50etf` / `300etf` / `500etf`）
-- 合约元数据：`metadata/wind_sse_optionchain.xlsx`（新版 DDE 直连的 topic 也从此文件推算）
+- DDE 路由表：`metadata/wxy_options.xlsx`，含 3 个 Sheet（`50etf` / `300etf` / `500etf`），DDE topic 地址的**唯一来源**，禁止推算
+- 合约元数据：`metadata/wind_sse_optionchain.xlsx`（Wind 导出，供 Monitor/market_cache 加载合约信息）
 - 默认市场数据目录固定为：`D:\MARKET_DATA`
 - DataBus 的快照、分片、日合并文件均写入该目录（按品种子目录存储）：
   - `D:\MARKET_DATA\snapshot_latest.parquet`（全量，Monitor 冷启动用）
@@ -198,7 +197,7 @@ Windows 提供两套 DDE API：
 _DDEClient._dde_callback()      ← DDEML 在消息泵线程触发
    │  解析 XlTable 二进制流（type=0x0001 FLOAT 记录）
    ▼
-_tick_buf                        ← 攒齐 5 个字段后触发回调
+_tick_buf                        ← 价格三件套+至少一个量字段到齐后触发回调
    ▼
 DDEDirectSubscriber._on_tick() → tick_queue → DataBus ZMQ PUB
 ```
@@ -287,7 +286,7 @@ vol_smile.html：requestAnimationFrame 增量渲染
 
 页面通过 WebSocket `/ws/vol_smile` 接收推送，断线 2s 自动重连，无需手动刷新。
 
-### 核心算法：向量化 Black-76 + 隐含远期
+### 核心算法：Black-76 + 隐含远期
 
 为规避 A 股融券成本高昂及股息率难以估计的问题，弃用标准 Black-Scholes 的现货 $S$ 与股息率 $q$，改用**隐含远期 + Black-76** 框架。
 
