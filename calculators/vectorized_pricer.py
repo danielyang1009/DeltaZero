@@ -1,16 +1,16 @@
 # -*- coding: utf-8 -*-
-"""calculators/vectorized_pricer.py — 100% 向量化 Black-76 IV 求解器。
+"""calculators/vectorized_pricer.py — Black-76 IV 求解器（Brent 法，绝对稳健）。
 
-三条金工容错机制（见代码内注释）：
-  [GUARD-1] 边界违规布尔掩码：Call C<disc*(F-K)、Put P<disc*(K-F) → 直接 nan，不进 NR
-  [GUARD-2] Vega 坍缩双重保护：np.maximum(vega,1e-8) + np.clip(step,-0.5,0.5)
-  [GUARD-3] T 毫秒级动态对齐：time.time() Unix 时间戳 + T<=0 拦截（np.maximum(T,1e-6)）
+两条金工容错机制（见代码内注释）：
+  [GUARD-1] 边界违规布尔掩码：price<=0 / not finite / K<=0 / price<intrinsic-1e-4 → nan，跳过 brentq
+  [GUARD-2] T 毫秒级动态对齐：time.time() Unix 时间戳 + T<=0 拦截（max(T,1e-6)）
 """
 from __future__ import annotations
 
 import math
 import time
 import numpy as np
+from scipy.optimize import brentq
 from scipy.special import erf as _erf
 
 _SQRT2   = math.sqrt(2.0)
@@ -28,20 +28,25 @@ def _npdf(x: np.ndarray) -> np.ndarray:
     return np.exp(-0.5 * x * x) / _SQRT2PI
 
 
+def _ncdf_scalar(x: float) -> float:
+    return 0.5 * math.erfc(-x / _SQRT2)
+
+
 class VectorizedIVCalculator:
-    """向量化 Black-76 IV 求解器（Newton-Raphson，防弹版）。"""
+    """Black-76 IV 求解器（Brent 法，绝对稳健，深度虚值期权不再 nan）。"""
 
     def __init__(self, n_iter: int = 12, tol: float = 5e-5):
+        # n_iter / tol 保留签名兼容，brentq 内部控制收敛，不使用这两个参数
         self.n_iter = n_iter
         self.tol    = tol
 
     # ──────────────────────────────────────────────────────────────
-    # [GUARD-3] T 的毫秒级计算
+    # [GUARD-2] T 的毫秒级计算
     # ──────────────────────────────────────────────────────────────
     @staticmethod
     def calc_T(expiry_timestamp: float) -> float:
         """
-        [GUARD-3] 用 time.time() 计算毫秒精度的年化剩余时间。
+        [GUARD-2] 用 time.time() 计算毫秒精度的年化剩余时间。
 
         T = (ExpiryTimestamp - time.time()) / 31_557_600
         返回 max(T, 1e-6)：防止 T<=0 导致 sqrt(T) 产生无效值。
@@ -59,10 +64,10 @@ class VectorizedIVCalculator:
         flag_arr: np.ndarray,    # shape (N,) +1=call, -1=put
     ) -> np.ndarray:
         """
-        批量求 Black-76 隐含波动率（无 Python for 循环）。
+        批量求 Black-76 隐含波动率（Brent 法逐合约求解）。
 
         Returns:
-            iv_arr shape (N,)，无效/不收敛 → nan。
+            iv_arr shape (N,)，无效/端点同号 → nan。
         """
         disc   = math.exp(-r * T)
         sqrt_T = math.sqrt(T)
@@ -80,42 +85,39 @@ class VectorizedIVCalculator:
             & (price_arr >= intrinsic - 1e-4)   # 1e-4 容许 DDE 报价噪声
         )
 
-        # ── 初始猜测（Brenner-Subrahmanyam ATM 近似） ─────────────
-        moneyness = np.abs(np.log(F / K_safe))
-        bs_guess  = price_arr / (F * sqrt_T) * math.sqrt(2 * math.pi) * math.exp(r * T)
-        sigma = np.where(moneyness < 0.05, np.clip(bs_guess, 0.01, 3.0), 0.3)
+        log_FK_arr = np.log(F / K_safe)
 
-        log_FK = np.log(F / K_safe)
+        iv_list: list[float] = []
+        for i in range(len(K_arr)):
+            if not valid[i]:
+                iv_list.append(float("nan"))
+                continue
 
-        # ── Newton-Raphson 迭代（100% 向量化） ────────────────────
-        for _ in range(self.n_iter):
-            sig_sqT  = sigma * sqrt_T
-            d1       = (log_FK + 0.5 * sigma ** 2 * T) / sig_sqT
-            d2       = d1 - sig_sqT
-            nd1, nd2 = _ncdf(d1), _ncdf(d2)
-            call_th  = disc * (F * nd1 - K_safe * nd2)
-            put_th   = disc * (K_safe * (1.0 - nd2) - F * (1.0 - nd1))
-            price_th = np.where(flag_arr > 0, call_th, put_th)
-            vega_raw = F * disc * _npdf(d1) * sqrt_T
+            K_i       = float(K_safe[i])
+            price_i   = float(price_arr[i])
+            flag_i    = float(flag_arr[i])
+            log_FK_i  = float(log_FK_arr[i])
 
-            # ── [GUARD-2] Vega 坍缩双重保护 ──────────────────────
-            safe_vega = np.maximum(vega_raw, 1e-8)
-            step      = np.clip((price_th - price_arr) / safe_vega, -0.5, 0.5)
+            def obj(sigma: float) -> float:
+                d1 = (log_FK_i + 0.5 * sigma * sigma * T) / (sigma * sqrt_T)
+                d2 = d1 - sigma * sqrt_T
+                if flag_i > 0:
+                    th = disc * (F * _ncdf_scalar(d1) - K_i * _ncdf_scalar(d2))
+                else:
+                    th = disc * (K_i * _ncdf_scalar(-d2) - F * _ncdf_scalar(-d1))
+                return th - price_i
 
-            sigma = np.clip(sigma - step, 1e-4, 5.0)
+            try:
+                f_lo = obj(1e-4)
+                f_hi = obj(5.0)
+                if f_lo * f_hi >= 0:
+                    iv_list.append(float("nan"))
+                else:
+                    iv_list.append(brentq(obj, 1e-4, 5.0, xtol=1e-6, maxiter=200))
+            except Exception:
+                iv_list.append(float("nan"))
 
-        # ── 收敛验证 ──────────────────────────────────────────────
-        sig_sqT  = sigma * sqrt_T
-        d1       = (log_FK + 0.5 * sigma ** 2 * T) / sig_sqT
-        d2       = d1 - sig_sqT
-        nd1, nd2 = _ncdf(d1), _ncdf(d2)
-        call_th  = disc * (F * nd1 - K_safe * nd2)
-        put_th   = disc * (K_safe * (1.0 - nd2) - F * (1.0 - nd1))
-        price_th = np.where(flag_arr > 0, call_th, put_th)
-        converged = np.abs(price_th - price_arr) < self.tol
-
-        # [GUARD-1] valid=False 的废合约替换为 nan
-        return np.where(valid & converged, sigma, np.nan)
+        return np.array(iv_list)
 
     def calc_greeks(
         self,

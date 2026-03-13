@@ -455,10 +455,12 @@ class _DDEClient:
         on_tick: Callable,
         service: str = "QD",
         heartbeat_interval: float = 30.0,
+        retry_interval: float = 10.0,
     ) -> None:
         self._on_tick_cb    = on_tick
         self._service       = service
         self._hb_interval   = heartbeat_interval
+        self._retry_interval = retry_interval
         self._running       = False
         self._pump_thread: Optional[threading.Thread] = None
 
@@ -468,6 +470,8 @@ class _DDEClient:
         # tick 缓冲（code → field → value），攒够核心字段后回调
         self._tick_buf: Dict[str, Dict[str, float]] = {}
         self._buf_lock = threading.Lock()
+        self._cb_total  = 0   # ADVISE 回调总次数（含未攒够的）
+        self._tick_total = 0  # 成功 emit 的 tick 数
 
         # ctypes DDEML 状态（在泵送线程中初始化）
         self._u32         = None
@@ -528,7 +532,25 @@ class _DDEClient:
         logger.info("DDEML 初始化成功, idInst=%d", self._idInst.value)
         try:
             self._connect_and_advise()
+
+            # 全部连接失败时按间隔重试，直到有连接成功或程序停止
+            retry_attempt = 1
             msg = _MSG()
+            while self._running and not self._convs:
+                logger.info(
+                    "DDE 全部连接失败，%ds 后第 %d 次重试（客户端可能未就绪）...",
+                    int(self._retry_interval), retry_attempt,
+                )
+                deadline = time.time() + self._retry_interval
+                while self._running and time.time() < deadline:
+                    while u32.PeekMessageW(ctypes.byref(msg), None, 0, 0, 1):
+                        u32.TranslateMessage(ctypes.byref(msg))
+                        u32.DispatchMessageW(ctypes.byref(msg))
+                    time.sleep(0.1)
+                if self._running:
+                    retry_attempt += 1
+                    self._connect_and_advise()
+
             last_hb = time.time()
 
             while self._running:
@@ -540,7 +562,8 @@ class _DDEClient:
 
                 if time.time() - last_hb > self._hb_interval:
                     last_hb = time.time()
-                    logger.debug("DDE 心跳: %d 个活跃连接", len(self._convs))
+                    logger.info("DDE 心跳: %d 个活跃连接, 累计回调 %d 次, 累计 tick %d 条",
+                                len(self._convs), self._cb_total, self._tick_total)
 
         except Exception as e:
             logger.error("DDE message loop 异常: %s", e)
@@ -637,10 +660,16 @@ class _DDEClient:
     def _accumulate(self, code: str, field: str, value: float) -> None:
         ts_ms = int(time.time() * 1000)
         with self._buf_lock:
+            self._cb_total += 1
+            if self._cb_total <= 5:
+                logger.info("DDE 回调 #%d: code=%s field=%s value=%s", self._cb_total, code, field, value)
             buf = self._tick_buf.setdefault(code, {})
             buf[field] = value
             if len(buf) >= 3:
                 self._on_tick_cb(code, dict(buf), ts_ms)
+                self._tick_total += 1
+                if self._tick_total <= 3:
+                    logger.info("DDE tick #%d: code=%s fields=%s", self._tick_total, code, list(buf.keys()))
                 buf.clear()
 
     def _close_ddeml(self) -> None:
@@ -687,6 +716,7 @@ class DDEDirectSubscriber(DataProvider):
         self._option_count: int = 0
         self._etf_count: int = 0
         self._active_underlyings: List[str] = []
+        self._unknown_codes: set = set()  # 已警告过的未知合约，避免重复刷屏
 
     @property
     def option_count(self) -> int:
@@ -740,7 +770,9 @@ class DDEDirectSubscriber(DataProvider):
             norm_code = normalize_code(code, ".SH")
             underlying = self._code_to_underlying.get(norm_code)
             if not underlying:
-                # 可能 topic_map 含未知合约，忽略
+                if norm_code not in self._unknown_codes:
+                    self._unknown_codes.add(norm_code)
+                    logger.warning("期权合约 %s 无 underlying（optionchain 未命中），tick 将被持续丢弃（仅警告一次）", norm_code)
                 return
             self._emit_option_tick(norm_code, underlying, fields, ts, ts_ms)
 

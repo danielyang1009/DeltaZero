@@ -83,6 +83,7 @@ h1{margin:0 0 12px;font-size:20px}
         <th class="iv-call">Call Bid/Ask IV</th>
         <th class="iv-put">Put IV</th>
         <th class="iv-put">Put Bid/Ask IV</th>
+        <th style="color:#2563eb">主力 IV</th>
         <th>IV Skew (C-P)</th>
         <th>PCP偏差</th>
       </tr>
@@ -150,16 +151,24 @@ function initChart() {
           data: [],
           borderColor: '#ef4444',
           backgroundColor: 'rgba(239,68,68,0.08)',
-          pointRadius: 4, pointHoverRadius: 6,
-          tension: 0.3, borderWidth: 2,
+          pointRadius: 3, pointHoverRadius: 5,
+          tension: 0.3, borderWidth: 1.5, borderDash: [4, 3],
         },
         {
           label: 'Put IV',
           data: [],
           borderColor: '#16a34a',
           backgroundColor: 'rgba(22,163,74,0.08)',
-          pointRadius: 4, pointHoverRadius: 6,
-          tension: 0.3, borderWidth: 2,
+          pointRadius: 3, pointHoverRadius: 5,
+          tension: 0.3, borderWidth: 1.5, borderDash: [4, 3],
+        },
+        {
+          label: '主力 IV（拼接）',
+          data: [],
+          borderColor: '#2563eb',
+          backgroundColor: 'rgba(37,99,235,0.10)',
+          pointRadius: 5, pointHoverRadius: 7,
+          tension: 0.3, borderWidth: 2.5,
         },
       ]
     },
@@ -220,14 +229,16 @@ Chart.register(spotLinePlugin);
 function updateChart(ed, spot) {
   if (!chart) return;
   const contracts = ed.contracts || [];
-  const callPts = contracts.filter(c => c.type === 'C' && c.iv != null).map(c => ({ x: c.strike, y: c.iv }));
-  const putPts  = contracts.filter(c => c.type === 'P' && c.iv != null).map(c => ({ x: c.strike, y: c.iv }));
+  const callPts    = contracts.filter(c => c.type === 'C' && c.iv != null).map(c => ({ x: c.strike, y: c.iv }));
+  const putPts     = contracts.filter(c => c.type === 'P' && c.iv != null).map(c => ({ x: c.strike, y: c.iv }));
+  const primaryPts = (ed.primary_ivs || []).map(p => ({ x: p.strike, y: p.iv }));
 
   chart.data.datasets[0].data = callPts;
   chart.data.datasets[1].data = putPts;
+  chart.data.datasets[2].data = primaryPts;
   chart._spotVal = spot;
 
-  const allIVs = [...callPts, ...putPts].map(p => p.y).filter(v => v != null && isFinite(v));
+  const allIVs = [...callPts, ...putPts, ...primaryPts].map(p => p.y).filter(v => v != null && isFinite(v));
   if (allIVs.length > 0) {
     chart.options.scales.y.min = Math.max(0, Math.min(...allIVs) - 0.02);
     chart.options.scales.y.max = Math.max(...allIVs) + 0.02;
@@ -247,6 +258,9 @@ function updateTableFull(ed, atmStrike) {
     if (!byStrike[c.strike]) byStrike[c.strike] = {};
     byStrike[c.strike][c.type] = c;
   }
+  // 主力 IV 索引
+  const primaryMap = {};
+  for (const p of (ed.primary_ivs || [])) primaryMap[p.strike] = p;
 
   const strikes = Object.keys(byStrike).map(Number).sort((a, b) => a - b);
 
@@ -257,7 +271,7 @@ function updateTableFull(ed, atmStrike) {
     for (const k of strikes) {
       const tr = document.createElement('tr');
       tr.id = `row_${k}`;
-      tr.innerHTML = `<td>${k.toFixed(3)}</td><td id="c_civ_${k}">-</td><td id="c_cbidask_${k}" class="spread">-</td><td id="c_piv_${k}">-</td><td id="c_pbidask_${k}" class="spread">-</td><td id="c_skew_${k}">-</td><td id="c_pcp_${k}">-</td>`;
+      tr.innerHTML = `<td>${k.toFixed(3)}</td><td id="c_civ_${k}">-</td><td id="c_cbidask_${k}" class="spread">-</td><td id="c_piv_${k}">-</td><td id="c_pbidask_${k}" class="spread">-</td><td id="c_primary_${k}" style="color:#2563eb;font-weight:600">-</td><td id="c_skew_${k}">-</td><td id="c_pcp_${k}">-</td>`;
       tbody.appendChild(tr);
     }
     _prevTable = {};
@@ -267,6 +281,7 @@ function updateTableFull(ed, atmStrike) {
     const grp = byStrike[k];
     const C = grp['C'];
     const P = grp['P'];
+    const PRI = primaryMap[k];
     const key = String(k);
     const prev = _prevTable[key] || {};
 
@@ -307,6 +322,12 @@ function updateTableFull(ed, atmStrike) {
     if (pbidask_str !== (prev.pbidask || '')) {
       document.getElementById(`c_pbidask_${k}`).textContent = pbidask_str;
       prev.pbidask = pbidask_str;
+    }
+    // 主力 IV
+    const primary_str = PRI ? `${(PRI.iv * 100).toFixed(2)}% (${PRI.flag})` : '-';
+    if (primary_str !== (prev.primary || '')) {
+      document.getElementById(`c_primary_${k}`).textContent = primary_str;
+      prev.primary = primary_str;
     }
     // IV Skew
     const skew_str = iv_skew != null ? (iv_skew * 100).toFixed(2) + '%' : '-';

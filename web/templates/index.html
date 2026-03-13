@@ -152,6 +152,24 @@ async function api(url, method="GET", body=null){
   return data;
 }
 
+async function openFile(path){
+  try{ await api("/api/open-file","POST",{path}); }
+  catch(e){ alert("打开失败: " + e.message); }
+}
+
+document.addEventListener("click", function(e){
+  const a = e.target.closest("a[data-open-path]");
+  if(!a) return;
+  e.preventDefault();
+  openFile(a.dataset.openPath);
+});
+
+function fileLink(name, path){
+  if(!path) return name;
+  const escapedPath = path.replace(/&/g,"&amp;").replace(/"/g,"&quot;");
+  return `<a href="#" data-open-path="${escapedPath}" style="color:inherit;text-decoration:underline;cursor:pointer">${name}</a>`;
+}
+
 function renderMetadataFiles(mf){
   const el = $("metadataFiles");
   if(!mf){
@@ -165,7 +183,8 @@ function renderMetadataFiles(mf){
   const lines = files.map(([name, info]) => {
     const ago = info ? info.mtime_ago : "未找到";
     const s = (!info || ago === "未找到" || ago === "文件不存在") ? "badge-down" : "badge-ok";
-    return `<div class="kv" style="margin:2px 0">${name} <span class="badge ${s}">${ago}</span></div>`;
+    const link = fileLink(name, info && info.path);
+    return `<div class="kv" style="margin:2px 0">${link} <span class="badge ${s}">${ago}</span></div>`;
   });
   el.innerHTML = lines.join("");
 }
@@ -178,13 +197,13 @@ function renderBondFiles(bf){
   const shibor = bf.shibor_yieldcurve;
   if(cgb){
     const s = cgb.mtime_ago === "文件不存在" ? "badge-down" : "badge-ok";
-    const fname = cgb.name || "—";
-    lines.push(`<div class="kv" style="margin:2px 0">${fname} <span class="badge ${s}">${cgb.mtime_ago}</span></div>`);
+    const link = fileLink(cgb.name || "—", cgb.path);
+    lines.push(`<div class="kv" style="margin:2px 0">${link} <span class="badge ${s}">${cgb.mtime_ago}</span></div>`);
   }
   if(shibor){
     const s = shibor.mtime_ago === "文件不存在" ? "badge-down" : "badge-ok";
-    const fname = shibor.name || "—";
-    lines.push(`<div class="kv" style="margin:2px 0">${fname} <span class="badge ${s}">${shibor.mtime_ago}</span></div>`);
+    const link = fileLink(shibor.name || "—", shibor.path);
+    lines.push(`<div class="kv" style="margin:2px 0">${link} <span class="badge ${s}">${shibor.mtime_ago}</span></div>`);
   }
   el.innerHTML = lines.join("");
 }

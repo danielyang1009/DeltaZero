@@ -301,6 +301,9 @@ def _compute_loop() -> None:
                 disc = math.exp(-r * T)
                 contracts_out = []
                 call_iv_map: Dict[float, float] = {}
+                put_iv_map:  Dict[float, float] = {}
+                call_spread_map: Dict[float, float] = {}
+                put_spread_map:  Dict[float, float] = {}
 
                 for flag_val, side, label in ((+1, calls, "C"), (-1, puts, "P")):
                     strikes = sorted(side.keys())
@@ -312,6 +315,14 @@ def _compute_loop() -> None:
                     ask_arr  = np.array([side[k]["ask"] for k in strikes])
                     flag_arr = np.full(len(strikes), float(flag_val))
 
+                    # ── [GUARD-3] 微观流动性防线：剔除宽口和废纸合约 ──
+                    spread_arr     = ask_arr - bid_arr
+                    max_spread_arr = np.maximum(0.0020, mid_arr * 0.30)
+                    liquidity_mask = (mid_arr >= 0.0010) & (spread_arr <= max_spread_arr)
+                    mid_arr[~liquidity_mask] = np.nan
+                    bid_arr[~liquidity_mask] = np.nan
+                    ask_arr[~liquidity_mask] = np.nan
+
                     iv_arr     = pricer.calc_iv(F, K_arr, T, r, mid_arr,  flag_arr)
                     bid_iv_arr = pricer.calc_iv(F, K_arr, T, r, bid_arr,  flag_arr)
                     ask_iv_arr = pricer.calc_iv(F, K_arr, T, r, ask_arr,  flag_arr)
@@ -319,6 +330,11 @@ def _compute_loop() -> None:
                     if label == "C":
                         for k, iv in zip(strikes, iv_arr):
                             call_iv_map[k] = float(iv)
+                            call_spread_map[k] = side[k]["ask"] - side[k]["bid"]
+                    else:
+                        for k, iv in zip(strikes, iv_arr):
+                            put_iv_map[k] = float(iv)
+                            put_spread_map[k] = side[k]["ask"] - side[k]["bid"]
 
                     for i, k in enumerate(strikes):
                         iv_v   = None if math.isnan(iv_arr[i])     else round(float(iv_arr[i]), 6)
@@ -344,10 +360,42 @@ def _compute_loop() -> None:
                             "pcp_dev": pcp_dev, "iv_skew": iv_skew,
                         })
 
+                # ── 流动性拼接：生成主力 IV 曲线 ──────────────────────
+                primary_ivs = []
+                for k in sorted(set(call_iv_map) & set(put_iv_map)):
+                    c_iv = call_iv_map[k]
+                    p_iv = put_iv_map[k]
+                    c_sp = call_spread_map.get(k, float("inf"))
+                    p_sp = put_spread_map.get(k, float("inf"))
+
+                    if k < F * 0.995:
+                        # Put 是虚值（干净），Call 是深度实值（脏）
+                        piv, flag = p_iv, "P"
+                    elif k > F * 1.005:
+                        # Call 是虚值（干净），Put 是深度实值（脏）
+                        piv, flag = c_iv, "C"
+                    else:
+                        # 平值附近：按买卖价差选流动性更好的一侧
+                        if c_sp < p_sp:
+                            piv, flag = c_iv, "C"
+                        elif p_sp < c_sp:
+                            piv, flag = p_iv, "P"
+                        else:
+                            if not math.isnan(c_iv) and not math.isnan(p_iv):
+                                piv, flag = (c_iv + p_iv) / 2, "AVG"
+                            elif not math.isnan(c_iv):
+                                piv, flag = c_iv, "C"
+                            else:
+                                piv, flag = p_iv, "P"
+
+                    if not math.isnan(piv):
+                        primary_ivs.append({"strike": k, "iv": round(piv, 6), "flag": flag})
+
                 entry = {
                     "F": round(F, 6), "T_days": round(T * 365.25, 4),
                     "r": round(r, 6), "atm_strike": K_atm,
                     "contracts": contracts_out,
+                    "primary_ivs": primary_ivs,
                 }
                 key_str = expiry_date.strftime("%Y-%m-%d")
                 (expiries_adj if is_adj else expiries_std)[key_str] = entry

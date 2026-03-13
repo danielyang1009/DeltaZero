@@ -6,6 +6,8 @@ from __future__ import annotations
 
 import asyncio
 import json as _json
+import os
+import subprocess
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -276,6 +278,7 @@ def _bond_files_info() -> Dict[str, Dict[str, Any]]:
             latest = files[0]
             result[key] = {
                 "name": latest.name,
+                "path": str(latest),
                 "mtime_ago": _mtime_ago_str(latest.stat().st_mtime),
             }
     return result
@@ -519,8 +522,14 @@ def get_state() -> Dict[str, Any]:
         "merge_status": merge_status,
         "market_data_dir": DEFAULT_MARKET_DATA_DIR,
         "metadata_files": {
-            "wind_sse_optionchain": {"mtime_ago": _wind_optionchain_mtime_ago()},
-            "wxy_options": {"mtime_ago": _file_mtime_ago(_METADATA_DIR / "wxy_options.xlsx")},
+            "wind_sse_optionchain": {
+                "path": str(_WIND_OPTIONCHAIN_PATH),
+                "mtime_ago": _wind_optionchain_mtime_ago(),
+            },
+            "wxy_options": {
+                "path": str(_METADATA_DIR / "wxy_options.xlsx"),
+                "mtime_ago": _file_mtime_ago(_METADATA_DIR / "wxy_options.xlsx"),
+            },
         },
         "bond_files": _bond_files_info(),
         "vol_smile_active_ago": _mtime_ago_str(_vol_smile_last_active) if _vol_smile_last_active else None,
@@ -723,6 +732,20 @@ def fetch_bond(req: FetchBondRequest) -> Dict[str, Any]:
         "output": "\n".join(output),
         "bond_files": _bond_files_info(),
     }
+
+
+class OpenFileRequest(BaseModel):
+    path: str
+
+
+@app.post("/api/open-file")
+def open_file(req: OpenFileRequest) -> Dict[str, Any]:
+    """用系统默认程序打开指定文件（仅限本机 Windows 调用）。"""
+    p = Path(req.path)
+    if not p.exists():
+        raise HTTPException(status_code=404, detail=f"文件不存在: {req.path}")
+    os.startfile(str(p))
+    return {"ok": True}
 
 
 _catalog_cache: Dict[str, Any] = {"mtime": None, "contracts": {}}

@@ -180,8 +180,10 @@ class PCPArbitrage:
         # OBI：订单流失衡度。正向套利：卖 Call（需买一支撑）、买 S（需卖一支撑）、买 Put（需卖一支撑）
         denom_c = c_bid_vol + c_ask_vol
         obi_c = (c_bid_vol / denom_c) if denom_c > 0 else None
-        denom_s = (s_ask_vol or 0) + (s_bid_vol or 0)
-        obi_s = (s_ask_vol / denom_s) if (s_ask_vol is not None and s_ask_vol > 0 and s_bid_vol is not None and denom_s > 0) else None
+        _s_bv = s_bid_vol or 0
+        _s_av = s_ask_vol or 0
+        denom_s = _s_av + _s_bv
+        obi_s = (_s_av / denom_s) if (_s_av > 0 and denom_s > 0) else None
         denom_p = p_bid_vol + p_ask_vol
         obi_p = (p_ask_vol / denom_p) if denom_p > 0 else None
 

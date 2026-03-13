@@ -41,9 +41,16 @@ def get_optionchain_path(target_date: date | None = None, metadata_dir: Path | N
     if csv_candidates:
         return csv_candidates[0]
     # 优先找名字含 optionchain 的 xlsx，再退而求其次找任意 xlsx
-    xlsx_candidates = sorted(base.glob("*optionchain*.xlsx"), reverse=True)
+    # 过滤 ~$ 开头的 Office 临时锁文件
+    xlsx_candidates = sorted(
+        (f for f in base.glob("*optionchain*.xlsx") if not f.name.startswith("~$")),
+        reverse=True,
+    )
     if not xlsx_candidates:
-        xlsx_candidates = sorted(base.glob("*.xlsx"), reverse=True)
+        xlsx_candidates = sorted(
+            (f for f in base.glob("*.xlsx") if not f.name.startswith("~$")),
+            reverse=True,
+        )
     if xlsx_candidates:
         return xlsx_candidates[0]
     return p
