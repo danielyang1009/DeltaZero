@@ -32,9 +32,17 @@ _rich_lkv_lock = threading.Lock()
 _running = False
 _thread: Optional[threading.Thread] = None
 _compute_thread: Optional[threading.Thread] = None
+_monitor_thread: Optional[threading.Thread] = None
 _event_loop: Optional[asyncio.AbstractEventLoop] = None
 _update_queue: Optional[asyncio.Queue] = None
+_monitor_queue_ref: Optional[asyncio.Queue] = None
 _start_time: Optional[float] = None
+
+_monitor_cache: Dict[str, Any] = {}
+_monitor_cache_lock = threading.Lock()
+
+_zmq_port: int = 5555
+_snapshot_dir: str = ""
 
 
 def _try_put(q: asyncio.Queue, item: Any) -> None:
@@ -55,6 +63,12 @@ def get_rich_snapshot() -> Dict[str, Any]:
     """返回最新计算结果浅拷贝（WS 广播兜底用）。"""
     with _rich_lkv_lock:
         return dict(_rich_lkv)
+
+
+def get_monitor_cache() -> Dict[str, Any]:
+    """返回最新 PCP 套利监控结果浅拷贝（WS 广播兜底用）。"""
+    with _monitor_cache_lock:
+        return dict(_monitor_cache)
 
 
 def get_status() -> Dict[str, Any]:
@@ -419,14 +433,259 @@ def _compute_loop() -> None:
             _event_loop.call_soon_threadsafe(_try_put, _update_queue, result)
 
 
+def _monitor_compute_loop() -> None:
+    """
+    后台 PCP 套利计算线程（Thread-3）：事件驱动，对齐终端 monitor 架构。
+
+    数据流：独立 ZMQ SUB（无CONFLATE）→ 增量 on_etf_tick/on_option_tick → scan → asyncio.Queue
+    顶层 try-except 确保任何未捕获异常只记录日志，线程不会静默退出。
+    """
+    try:
+        import zmq as _zmq
+    except ImportError:
+        logger.error("market_cache_monitor: 缺少 pyzmq，线程退出")
+        return
+
+    from config.settings import UNDERLYINGS, ETF_CODE_TO_NAME, DEFAULT_EXPIRY_DAYS, DEFAULT_MIN_PROFIT
+    from monitors.common import (
+        init_strategy_and_contracts, select_pairs_by_atm,
+        parse_zmq_message, restore_from_snapshot,
+    )
+    from data_engine.contract_catalog import get_optionchain_path, ContractInfoManager
+    from models import ETFTickData
+
+    # ── 策略初始化（含冷启动快照恢复）──────────────────────────────────
+    def _init_strategy():
+        snap = get_snapshot()
+        etf_prices: Dict[str, float] = {}
+        for code, rec in snap.items():
+            if str(rec.get("type", "")).lower() == "etf":
+                last = rec.get("last")
+                if isinstance(last, (int, float)) and last > 0:
+                    etf_prices[code] = float(last)
+
+        path = get_optionchain_path()
+        mtime = path.stat().st_mtime if path.exists() else None
+
+        # 第一次 restore：用空策略预热 etf_prices（与终端 monitor 一致）
+        tmp_strategy_cfg_args = dict(
+            min_profit=DEFAULT_MIN_PROFIT,
+            expiry_days=DEFAULT_EXPIRY_DAYS,
+            atm_range_pct=0.20,
+            etf_prices=etf_prices,
+        )
+        strat, contract_mgr, active, pairs, option_codes, etf_codes = init_strategy_and_contracts(
+            **tmp_strategy_cfg_args
+        )
+        restore_from_snapshot(strat, _snapshot_dir, etf_prices)
+
+        # 第二次 restore：正式填充 aligner
+        restore_from_snapshot(strat, _snapshot_dir, etf_prices)
+        logger.info("market_cache_monitor: 策略初始化成功，配对 %d 组", len(pairs))
+        return strat, contract_mgr, pairs, etf_prices, mtime
+
+    strategy = None
+    contract_mgr = None
+    pairs = None
+    optionchain_mtime = None
+    mtime_check_ts = 0.0
+    sock = None
+
+    # 等待 LKV 有数据后再初始化（避免首次启动 etf_prices 为空）
+    _init_wait = 0
+    while _running and not get_snapshot():
+        time.sleep(0.5)
+        _init_wait += 1
+        if _init_wait > 20:
+            break
+
+    while _running:
+        # ── 首次 / 文件变更后初始化 ────────────────────────────────
+        if strategy is None:
+            try:
+                strategy, contract_mgr, pairs, etf_display, optionchain_mtime = _init_strategy()
+                mtime_check_ts = time.time()
+            except Exception as e:
+                logger.warning("market_cache_monitor: 策略初始化失败: %s，5s 后重试", e)
+                time.sleep(5.0)
+                continue
+
+            # 建立独立 ZMQ SUB socket（无 CONFLATE）
+            if sock is not None:
+                try:
+                    sock.close(linger=0)
+                except Exception:
+                    pass
+            sock = _zmq.Context.instance().socket(_zmq.SUB)
+            sock.setsockopt(_zmq.RCVTIMEO, 100)
+            sock.setsockopt_string(_zmq.SUBSCRIBE, "OPT_")
+            sock.setsockopt_string(_zmq.SUBSCRIBE, "ETF_")
+            try:
+                sock.connect(f"tcp://127.0.0.1:{_zmq_port}")
+                logger.info("market_cache_monitor: ZMQ 已连接 tcp://127.0.0.1:%d", _zmq_port)
+            except Exception as e:
+                logger.warning("market_cache_monitor: ZMQ 连接失败: %s", e)
+
+        stream_underlyings: set = set()
+        last_scan = datetime.now()
+
+        while _running and strategy is not None:
+            try:
+                # ── 每 60s 检查 optionchain 文件变更 ──────────────
+                now_ts = time.time()
+                if now_ts - mtime_check_ts > 60.0:
+                    mtime_check_ts = now_ts
+                    try:
+                        path = get_optionchain_path()
+                        mtime = path.stat().st_mtime if path.exists() else None
+                        if mtime != optionchain_mtime:
+                            logger.info("market_cache_monitor: optionchain 已变更，触发重新初始化")
+                            strategy = None
+                            break
+                    except Exception:
+                        pass
+
+                # ── 批量接收 ZMQ 消息（最多 200 条/cycle）──────────
+                msgs_recv = 0
+                while msgs_recv < 200:
+                    try:
+                        raw = sock.recv_string()
+                    except _zmq.Again:
+                        break
+                    except Exception as e:
+                        logger.warning("market_cache_monitor: ZMQ recv 错误: %s", e)
+                        break
+                    tick = parse_zmq_message(raw)
+                    if tick is None:
+                        msgs_recv += 1
+                        continue
+                    if isinstance(tick, ETFTickData):
+                        strategy.on_etf_tick(tick)
+                        etf_display[tick.etf_code] = tick.price
+                        stream_underlyings.add(tick.etf_code)
+                    else:
+                        strategy.on_option_tick(tick)
+                        if contract_mgr is not None:
+                            info = contract_mgr.contracts.get(tick.contract_code)
+                            if info:
+                                stream_underlyings.add(info.underlying_code)
+                    msgs_recv += 1
+
+                # ── 判断是否需要刷新 ────────────────────────────────
+                now = datetime.now()
+                elapsed = (now - last_scan).total_seconds()
+                should_refresh = msgs_recv > 0 or elapsed >= 3.0
+                if not should_refresh:
+                    continue
+
+                last_scan = now
+                now_ts = time.time()
+
+                # ── 筛选配对 & 计算信号 ─────────────────────────────
+                if stream_underlyings:
+                    pairs_for_scan = [p for p in (pairs or []) if p[0].underlying_code in stream_underlyings]
+                    etf_view = {k: v for k, v in etf_display.items() if k in stream_underlyings}
+                else:
+                    pairs_for_scan = list(pairs or [])
+                    etf_view = dict(etf_display)
+
+                display_pairs = select_pairs_by_atm(pairs_for_scan, etf_view, n_each_side=0)
+                try:
+                    signals = strategy.scan_pairs_for_display(display_pairs)
+                except Exception as e:
+                    logger.warning("market_cache_monitor: scan_pairs_for_display 异常: %s", e)
+                    continue
+
+                # ── 序列化 ────────────────────────────────────────
+                ul_groups: Dict[str, list] = {}
+                for sig in signals:
+                    ul_groups.setdefault(sig.underlying_code, []).append(sig)
+
+                underlyings_data: Dict[str, Any] = {}
+                for ul in UNDERLYINGS:
+                    sigs = ul_groups.get(ul, [])
+                    etf_price = etf_display.get(ul)
+                    n_pairs_ul = sum(1 for p in (pairs or []) if p[0].underlying_code == ul)
+                    sigs_sorted = sorted(sigs, key=lambda s: (s.expiry, s.multiplier, s.strike))
+                    signals_out = []
+                    for sig in sigs_sorted:
+                        signals_out.append({
+                            "strike": sig.strike,
+                            "expiry": sig.expiry.strftime("%Y-%m-%d"),
+                            "multiplier": sig.multiplier,
+                            "is_adjusted": sig.is_adjusted,
+                            "net_profit": round(sig.net_profit_estimate, 1),
+                            "net_1tick": round(sig.net_1tick, 1) if sig.net_1tick is not None else None,
+                            "tolerance": round(sig.tolerance, 2) if sig.tolerance is not None else None,
+                            "max_qty": round(sig.max_qty, 1) if sig.max_qty is not None else None,
+                            "spread_ratio": round(sig.spread_ratio, 4) if sig.spread_ratio is not None else None,
+                            "obi_c": round(sig.obi_c, 3) if sig.obi_c is not None else None,
+                            "obi_s": round(sig.obi_s, 3) if sig.obi_s is not None else None,
+                            "obi_p": round(sig.obi_p, 3) if sig.obi_p is not None else None,
+                            "call_bid": sig.call_bid,
+                            "put_ask": sig.put_ask,
+                            "spot_ask": sig.spot_price,
+                        })
+                    underlyings_data[ul] = {
+                        "name": ETF_CODE_TO_NAME.get(ul, ul),
+                        "spot": round(etf_price, 4) if etf_price else None,
+                        "n_pairs": n_pairs_ul,
+                        "n_quoted": len(sigs),
+                        "n_positive": sum(1 for s in sigs if s.net_profit_estimate >= 0),
+                        "signals": signals_out,
+                        "ivs": {},
+                    }
+
+                # ── 提取各品种各到期日 ATM IV ──────────────────────
+                try:
+                    rich_snap = get_rich_snapshot()
+                    for ul in UNDERLYINGS:
+                        ul_rich = rich_snap.get(ul, {})
+                        ivs_out: Dict[str, Any] = {}
+                        for exp_str, exp_data in ul_rich.get("expiries", {}).items():
+                            atm_strike = exp_data.get("atm_strike")
+                            primary_ivs = exp_data.get("primary_ivs", [])
+                            T_days = exp_data.get("T_days")
+                            if not primary_ivs or atm_strike is None:
+                                continue
+                            closest = min(primary_ivs, key=lambda x: abs(x["strike"] - atm_strike))
+                            ivs_out[exp_str] = {
+                                "atm_iv": round(closest["iv"], 4),
+                                "T_days": round(T_days, 1) if T_days is not None else None,
+                            }
+                        underlyings_data[ul]["ivs"] = ivs_out
+                except Exception as e:
+                    logger.debug("market_cache_monitor: IV 提取异常: %s", e)
+
+                result = {"ts": int(now_ts * 1000), "underlyings": underlyings_data}
+
+                with _monitor_cache_lock:
+                    _monitor_cache.clear()
+                    _monitor_cache.update(result)
+
+                if _event_loop is not None and _monitor_queue_ref is not None:
+                    _event_loop.call_soon_threadsafe(_try_put, _monitor_queue_ref, result)
+
+            except Exception as _exc:
+                logger.exception("market_cache_monitor: 顶层未捕获异常（线程继续）: %s", _exc)
+
+    if sock is not None:
+        try:
+            sock.close(linger=0)
+        except Exception:
+            pass
+
+
 def start(
     zmq_port: int = 5555,
     snapshot_dir: Optional[str] = None,
     event_loop: Optional[asyncio.AbstractEventLoop] = None,
     update_queue: Optional[asyncio.Queue] = None,
+    monitor_queue: Optional[asyncio.Queue] = None,
 ) -> None:
     """启动 ZMQ 订阅 + 计算后台线程（幂等，重复调用无副作用）。"""
-    global _running, _thread, _compute_thread, _event_loop, _update_queue
+    global _running, _thread, _compute_thread, _monitor_thread, _event_loop, _update_queue, _monitor_queue_ref
+    global _zmq_port, _snapshot_dir
 
     if _running and _thread is not None and _thread.is_alive():
         return
@@ -435,8 +694,11 @@ def start(
         from config.settings import DEFAULT_MARKET_DATA_DIR
         snapshot_dir = DEFAULT_MARKET_DATA_DIR
 
-    _event_loop   = event_loop
-    _update_queue = update_queue
+    _event_loop        = event_loop
+    _update_queue      = update_queue
+    _monitor_queue_ref = monitor_queue
+    _zmq_port          = zmq_port
+    _snapshot_dir      = snapshot_dir
     _running = True
     _start_time = time.time()
 
@@ -451,16 +713,22 @@ def start(
         daemon=True,
         name="market-cache-compute",
     )
+    _monitor_thread = threading.Thread(
+        target=_monitor_compute_loop,
+        daemon=True,
+        name="market-cache-monitor",
+    )
     _thread.start()
     _compute_thread.start()
-    logger.info("market_cache: 已启动 zmq + compute 线程 (port=%d)", zmq_port)
+    _monitor_thread.start()
+    logger.info("market_cache: 已启动 zmq + compute + monitor 线程 (port=%d)", zmq_port)
 
 
 def stop() -> None:
     """停止后台线程。"""
     global _running
     _running = False
-    for t in (_thread, _compute_thread):
+    for t in (_thread, _compute_thread, _monitor_thread):
         if t is not None:
             t.join(timeout=2.0)
     logger.info("market_cache: 已停止")

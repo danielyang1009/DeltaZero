@@ -22,7 +22,7 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
 from config.settings import DEFAULT_MARKET_DATA_DIR, DEFAULT_MIN_PROFIT, DEFAULT_EXPIRY_DAYS, DEFAULT_N_EACH_SIDE, DEFAULT_REFRESH_SECS
-from web.market_cache import get_snapshot, get_rich_snapshot, get_status as get_market_cache_status, start as start_market_cache, stop as stop_market_cache
+from web.market_cache import get_snapshot, get_rich_snapshot, get_monitor_cache, get_status as get_market_cache_status, start as start_market_cache, stop as stop_market_cache
 from web.data_stats import (
     chunks_readable,
     count_today_chunks,
@@ -49,21 +49,26 @@ from utils.time_utils import bj_now_naive, bj_today
 TEMPLATE_PATH = Path(__file__).resolve().parent / "templates" / "index.html"
 DDE_TEMPLATE_PATH = Path(__file__).resolve().parent / "templates" / "dde.html"
 VOL_SMILE_TEMPLATE_PATH = Path(__file__).resolve().parent / "templates" / "vol_smile.html"
+MONITOR_TEMPLATE_PATH = Path(__file__).resolve().parent / "templates" / "monitor.html"
 
 app = FastAPI(title="DeltaZero Web Console", version="0.3.0")
 
 _ws_clients: set = set()
+_monitor_ws_clients: set = set()
 _update_queue: Optional[asyncio.Queue] = None
+_monitor_queue: Optional[asyncio.Queue] = None
 _event_loop: Optional[asyncio.AbstractEventLoop] = None
 
 
 @app.on_event("startup")
 async def _startup() -> None:
-    global _update_queue, _event_loop
+    global _update_queue, _monitor_queue, _event_loop
     _event_loop = asyncio.get_running_loop()
-    _update_queue = asyncio.Queue(maxsize=2)   # maxsize=2 防堆积，旧数据自动丢弃
-    start_market_cache(event_loop=_event_loop, update_queue=_update_queue)
+    _update_queue = asyncio.Queue(maxsize=2)
+    _monitor_queue = asyncio.Queue(maxsize=2)
+    start_market_cache(event_loop=_event_loop, update_queue=_update_queue, monitor_queue=_monitor_queue)
     asyncio.create_task(_ws_broadcaster())
+    asyncio.create_task(_monitor_broadcaster())
 
 
 @app.on_event("shutdown")
@@ -89,6 +94,46 @@ async def _ws_broadcaster() -> None:
                 dead.add(ws)
         _ws_clients.difference_update(dead)
 
+
+
+async def _monitor_broadcaster() -> None:
+    """从 asyncio.Queue 接收 PCP 监控结果，广播给所有 /ws/monitor 客户端。"""
+    while True:
+        try:
+            data = await asyncio.wait_for(_monitor_queue.get(), timeout=1.0)
+        except asyncio.TimeoutError:
+            continue
+        if not _monitor_ws_clients:
+            continue
+        msg = _json.dumps({"ok": True, "ts": int(time.time() * 1000), "data": data})
+        dead: set = set()
+        for ws in list(_monitor_ws_clients):
+            try:
+                await ws.send_text(msg)
+            except Exception:
+                dead.add(ws)
+        _monitor_ws_clients.difference_update(dead)
+
+
+@app.websocket("/ws/monitor")
+async def ws_monitor(ws: WebSocket) -> None:
+    await ws.accept()
+    _monitor_ws_clients.add(ws)
+    snap = get_monitor_cache()
+    if snap:
+        await ws.send_text(_json.dumps({"ok": True, "ts": int(time.time() * 1000), "data": snap}))
+    try:
+        while True:
+            await ws.receive_text()
+    except (WebSocketDisconnect, Exception):
+        pass
+    finally:
+        _monitor_ws_clients.discard(ws)
+
+
+@app.get("/monitor", response_class=HTMLResponse)
+def monitor_page() -> str:
+    return MONITOR_TEMPLATE_PATH.read_text(encoding="utf-8")
 
 
 @app.websocket("/ws/vol_smile")

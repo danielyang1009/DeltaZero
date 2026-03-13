@@ -12,9 +12,10 @@ ETF 期权 PCP 套利工具，采用四层流水线结构：
 【第 3 层】消费层（ZMQ SUB）
   monitors/monitor.py      — Rich 终端 UI 实时刷新（PCP 套利信号）
   web/market_cache.py      — CONFLATE=1 → LKV 快照 → compute 线程 Brent 法 IV
+                           — 独立 ZMQ SUB（无CONFLATE）→ 增量 aligner → PCP 套利信号 → /ws/monitor
        ↓
 【第 4 层】展示层
-  web/dashboard.py         — FastAPI 控制台 + WebSocket /ws/vol_smile 推送
+  web/dashboard.py         — FastAPI 控制台 + WebSocket /ws/vol_smile + /ws/monitor 推送
 ```
 
 | 层 | 模块 | 说明 |
@@ -253,6 +254,8 @@ xlsx 是 ZIP，`_load_topic_map()` 解析其中的 `xl/externalLinks/externalLin
 
 ## 最近变更
 
+- **Web Monitor 页面（`/monitor`）**：新增网页版 PCP 套利监控，`market-cache-monitor` 线程独立 ZMQ SUB（无 CONFLATE）+ 事件驱动，收到 tick 立即触发计算，aligner 增量更新（不再每轮 reset），数据延迟与终端 monitor 对齐；对应 WebSocket 端点 `/ws/monitor`
+- **DDE 数据流文档**：新增 `docs/dde_dataflow.md`（全链路说明）与 `docs/dde_no_excel_research.md`（脱离 Excel 直连可行性研究）
 - **IV 求解器：NR → Brent 法**：`VectorizedIVCalculator.calc_iv()` 由 Newton-Raphson 向量化迭代改为 `scipy.optimize.brentq` 逐合约求解，彻底消除深度虚值期权（Vega 极小）场景下的发散 `nan`
 - **GUARD-3 微观流动性防线**：`market_cache._compute_loop` 新增前置过滤，mid < 10 Tick 或价差 > max(20 Tick, mid×30%) 的合约 mid/bid/ask 三路同步置 `nan`，阻断废盘口进入 Brent 求解
 - **主力 IV 曲线（流动性拼接）**：`market_cache` 新增 `primary_ivs` 字段，按 K vs F 择优选用 OTM 侧 IV，平值附近按盘口价差取最紧侧；前端 vol_smile.html 以蓝色粗线展示，表格新增"主力 IV"列（含来源标注 C/P/AVG）

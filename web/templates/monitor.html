@@ -1,0 +1,259 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>PCP 套利监控 — DeltaZero</title>
+<style>
+*{box-sizing:border-box}
+body{font-family:"Segoe UI",Arial,sans-serif;margin:0;padding:16px 20px;background:#f0f2f5;color:#1a1a2e}
+h1{margin:0 0 12px;font-size:20px}
+.controls{display:flex;gap:16px;flex-wrap:wrap;align-items:center;background:#fff;border:1px solid #dde1ea;border-radius:10px;padding:12px 16px;margin-bottom:12px}
+.controls label{font-size:13px;color:#475569;margin-right:4px}
+.controls input{padding:4px 8px;border:1px solid #cbd5e1;border-radius:6px;font-size:13px;width:72px}
+#wsStatus{font-size:12px;font-weight:600;margin-left:auto}
+#wsStatus.connected{color:#16a34a}
+#wsStatus.disconnected{color:#dc2626}
+.ul-card{background:#fff;border:1px solid #dde1ea;border-radius:10px;margin-bottom:12px;overflow:hidden}
+.ul-header{display:flex;align-items:center;gap:10px;padding:10px 16px;cursor:pointer;user-select:none;background:#f8fafc;border-bottom:1px solid #e2e8f0;font-size:13px;font-weight:600}
+.ul-header:hover{background:#f1f5f9}
+.ul-header .toggle{font-size:11px;color:#94a3b8;min-width:12px}
+.ul-header .spot{color:#475569;font-weight:400}
+.ul-header .stats{color:#64748b;font-weight:400;margin-left:auto;font-size:12px;white-space:nowrap}
+.iv-bar{display:flex;flex-wrap:wrap;gap:8px;padding:7px 16px;background:#eff6ff;border-bottom:1px solid #dbeafe;font-size:12px;color:#1d4ed8}
+.iv-bar .iv-item{white-space:nowrap}
+.iv-bar .iv-item span{color:#64748b;margin-right:2px}
+.ul-body.collapsed{display:none}
+.group-sep{padding:5px 16px;background:#f8fafc;border-bottom:1px solid #e2e8f0;font-size:12px;color:#64748b;font-weight:500}
+table.sig-table{width:100%;border-collapse:collapse;font-size:12px}
+table.sig-table th{background:#f8fafc;padding:5px 8px;text-align:right;border-bottom:2px solid #e2e8f0;white-space:nowrap;font-weight:500;color:#475569}
+table.sig-table th:first-child{text-align:left}
+table.sig-table td{padding:4px 8px;text-align:right;border-bottom:1px solid #f1f5f9}
+table.sig-table td:first-child{text-align:left;font-weight:600}
+tr.profit-pos td{color:#16a34a;font-weight:600}
+tr.profit-zero td{color:#1a1a2e}
+tr.profit-neg td{color:#94a3b8}
+</style>
+</head>
+<body>
+<h1>PCP 套利监控
+  <span id="wsStatus" class="disconnected">● 未连接</span>
+</h1>
+
+<div class="controls">
+  <span>
+    <label>净利润门槛（元）</label>
+    <input id="inpMinProfit" type="number" value="36" min="0" step="1"/>
+  </span>
+  <span>
+    <label>ATM 上下各（0=全部）</label>
+    <input id="inpNEachSide" type="number" value="0" min="0" step="1" max="20"/>
+  </span>
+  <span id="lastUpdate" style="font-size:12px;color:#94a3b8"></span>
+</div>
+
+<div id="root"></div>
+
+<script>
+const UNDERLYINGS = ["510050.SH","510300.SH","510500.SH"];
+let _data = null;
+let _collapsed = {};
+let _rafPending = false;
+let _ws = null;
+let _reconnectTimer = null;
+
+function fmt(v, digits){
+  if(v === null || v === undefined) return "—";
+  return Number(v).toFixed(digits);
+}
+
+function minProfit(){ return parseFloat(document.getElementById("inpMinProfit").value) || 0; }
+function nEachSide(){ return parseInt(document.getElementById("inpNEachSide").value) || 0; }
+
+/* 客户端 ATM±N 过滤：按 (expiry, multiplier) 分组，各组独立找 ATM */
+function filterByAtm(sigs, spot, n){
+  if(n <= 0) return sigs;
+  const groups = {};
+  for(const sig of sigs){
+    const gk = sig.expiry + "|" + sig.multiplier;
+    if(!groups[gk]) groups[gk] = [];
+    groups[gk].push(sig);
+  }
+  const result = [];
+  for(const gk of Object.keys(groups)){
+    const rows = groups[gk];
+    const strikes = [...new Set(rows.map(r => r.strike))].sort((a,b) => a-b);
+    if(!strikes.length) continue;
+    const atm = spot > 0
+      ? strikes.reduce((a,b) => Math.abs(b-spot) < Math.abs(a-spot) ? b : a)
+      : strikes[Math.floor(strikes.length/2)];
+    const idx = strikes.indexOf(atm);
+    const lo = Math.max(0, idx - n);
+    const hi = Math.min(strikes.length - 1, idx + n);
+    const selected = new Set(strikes.slice(lo, hi+1));
+    result.push(...rows.filter(r => selected.has(r.strike)));
+  }
+  return result;
+}
+
+function scheduleRender(){
+  if(_rafPending) return;
+  _rafPending = true;
+  requestAnimationFrame(doRender);
+}
+
+function doRender(){
+  _rafPending = false;
+  if(!_data) return;
+  const mp = minProfit();
+  const n  = nEachSide();
+  const root = document.getElementById("root");
+  const underlyings = _data.underlyings || {};
+  let html = "";
+
+  for(const ul of UNDERLYINGS){
+    const ud = underlyings[ul];
+    if(!ud) continue;
+
+    const name  = ud.name || ul;
+    const spot  = ud.spot != null ? ud.spot : 0;
+    const spotFmt = spot ? spot.toFixed(4) : "—";
+    const nPairs  = ud.n_pairs || 0;
+    const sigs    = ud.signals || [];
+    const filtered = filterByAtm(sigs, spot, n);
+    const nQuoted  = filtered.length;
+    const nPositive = filtered.filter(s => s.net_profit >= 0).length;
+    const nAbove    = filtered.filter(s => s.net_profit >= mp).length;
+
+    const collapsed = !!_collapsed[ul];
+    const toggleIcon = collapsed ? "▶" : "▼";
+
+    html += `<div class="ul-card">`;
+
+    // 标题行
+    html += `<div class="ul-header" onclick="toggleCard('${ul}')">`;
+    html += `<span class="toggle">${toggleIcon}</span>`;
+    html += `<span>${name}</span>`;
+    html += `<span class="spot">现价: ${spotFmt}</span>`;
+    html += `<span class="stats">`;
+    html += `配对: ${nPairs} &nbsp;|&nbsp; `;
+    html += `有报价: ${nQuoted} &nbsp;|&nbsp; `;
+    html += `正向: ${nPositive} &nbsp;|&nbsp; `;
+    html += `≥${mp}元: <strong>${nAbove}</strong>`;
+    html += `</span></div>`;
+
+    // IV 行
+    const ivs = ud.ivs || {};
+    const ivKeys = Object.keys(ivs).sort();
+    if(ivKeys.length){
+      html += `<div class="iv-bar">`;
+      for(const exp of ivKeys){
+        const iv = ivs[exp];
+        const td = iv.T_days != null ? `${iv.T_days}d` : "";
+        const ivPct = (iv.atm_iv * 100).toFixed(1) + "%";
+        const expShort = exp.slice(5);  // MM-DD
+        html += `<span class="iv-item"><span>${expShort}(${td})</span>${ivPct}</span>`;
+      }
+      html += `</div>`;
+    }
+
+    // 正文（可折叠）
+    html += `<div class="ul-body${collapsed ? " collapsed" : ""}">`;
+
+    if(filtered.length === 0){
+      html += `<div style="padding:12px 16px;color:#94a3b8;font-size:12px">暂无数据</div>`;
+    } else {
+      // 按 (expiry, multiplier) 分组
+      const groups = {};
+      for(const sig of filtered){
+        const gk = sig.expiry + "|" + sig.multiplier;
+        if(!groups[gk]) groups[gk] = {expiry:sig.expiry, multiplier:sig.multiplier, is_adjusted:sig.is_adjusted, rows:[]};
+        groups[gk].rows.push(sig);
+      }
+
+      html += `<table class="sig-table">`;
+      html += `<thead><tr>`;
+      html += `<th>行权价</th><th>净利润</th><th>Net_1T</th><th>TOL</th>`;
+      html += `<th>Max_Qty</th><th>SPRD</th><th>OBI_C</th><th>OBI_P</th><th>OBI_S</th>`;
+      html += `<th>C_bid</th><th>P_ask</th><th>S_ask</th>`;
+      html += `</tr></thead><tbody>`;
+
+      for(const gk of Object.keys(groups)){
+        const g = groups[gk];
+        const adjLabel = g.is_adjusted ? ` [调整×${g.multiplier}]` : ` [×${g.multiplier}]`;
+        html += `<tr><td colspan="12" style="padding:0"><div class="group-sep">${g.expiry}${adjLabel}</div></td></tr>`;
+        for(const sig of g.rows){
+          let rowClass = "profit-neg";
+          if(sig.net_profit >= mp)     rowClass = "profit-pos";
+          else if(sig.net_profit >= 0) rowClass = "profit-zero";
+
+          html += `<tr class="${rowClass}">`;
+          html += `<td>${fmt(sig.strike,4)}</td>`;
+          html += `<td>${fmt(sig.net_profit,1)}</td>`;
+          html += `<td>${fmt(sig.net_1tick,1)}</td>`;
+          html += `<td>${fmt(sig.tolerance,2)}</td>`;
+          html += `<td>${fmt(sig.max_qty,1)}</td>`;
+          html += `<td>${sig.spread_ratio!=null?(sig.spread_ratio*100).toFixed(1)+"%":"—"}</td>`;
+          html += `<td>${fmt(sig.obi_c,3)}</td>`;
+          html += `<td>${fmt(sig.obi_p,3)}</td>`;
+          html += `<td>${fmt(sig.obi_s,3)}</td>`;
+          html += `<td>${fmt(sig.call_bid,4)}</td>`;
+          html += `<td>${fmt(sig.put_ask,4)}</td>`;
+          html += `<td>${fmt(sig.spot_ask,4)}</td>`;
+          html += `</tr>`;
+        }
+      }
+
+      html += `</tbody></table>`;
+    }
+
+    html += `</div></div>`;
+  }
+
+  root.innerHTML = html;
+}
+
+function toggleCard(ul){
+  _collapsed[ul] = !_collapsed[ul];
+  scheduleRender();
+}
+
+document.getElementById("inpMinProfit").addEventListener("input", scheduleRender);
+document.getElementById("inpNEachSide").addEventListener("input", scheduleRender);
+
+function connect(){
+  if(_reconnectTimer){ clearTimeout(_reconnectTimer); _reconnectTimer = null; }
+  const wsUrl = "ws://" + location.host + "/ws/monitor";
+  _ws = new WebSocket(wsUrl);
+
+  _ws.onopen = function(){
+    setStatus("connected","● 已连接");
+  };
+  _ws.onmessage = function(ev){
+    try{
+      const msg = JSON.parse(ev.data);
+      if(msg.ok && msg.data){
+        _data = msg.data;
+        const ts = new Date(msg.ts);
+        document.getElementById("lastUpdate").textContent = "更新: " + ts.toLocaleTimeString("zh-CN");
+        scheduleRender();
+      }
+    }catch(e){}
+  };
+  _ws.onclose = function(){
+    setStatus("disconnected","● 已断开");
+    _reconnectTimer = setTimeout(connect, 2000);
+  };
+  _ws.onerror = function(){ _ws.close(); };
+}
+
+function setStatus(cls, text){
+  const el = document.getElementById("wsStatus");
+  el.className = cls;
+  el.textContent = text;
+}
+
+connect();
+</script>
+</body>
+</html>
