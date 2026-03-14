@@ -102,6 +102,41 @@ python -m monitors.monitor --zmq-port 5555
   - `D:\MARKET_DATA\{510050|510300|510500}\options_YYYYMMDD.parquet`（日终合并）
   - `D:\MARKET_DATA\{510050|510300|510500}\etf_YYYYMMDD.parquet`
 - Parquet 压缩：zstd；options/snapshot 的 askv1/bidv1 为 int16，ETF 保持 int32
+
+### Parquet Schema
+
+**期权分片 / 日文件（`options_*.parquet`）**
+
+| 列名 | 类型 | 说明 |
+|------|------|------|
+| `ts` | int64 | Unix 时间戳（毫秒） |
+| `code` | string | 合约代码，如 `10006217.SH` |
+| `underlying` | string | 标的代码，如 `510050.SH` |
+| `last` | float32 | 最新价 |
+| `ask1` | float32 | 卖一价 |
+| `bid1` | float32 | 买一价 |
+| `askv1` | int16 | 卖一量（手） |
+| `bidv1` | int16 | 买一量（手） |
+| `oi` | int32 | 持仓量 |
+| `vol` | int32 | 成交量 |
+| `high` | float32 | 当日最高价 |
+| `low` | float32 | 当日最低价 |
+| `is_adjusted` | bool | 是否分红调整型合约 |
+| `multiplier` | int32 | 合约乘数（标准 10000，调整型如 10265） |
+
+**ETF 分片 / 日文件（`etf_*.parquet`）**
+
+| 列名 | 类型 | 说明 |
+|------|------|------|
+| `ts` | int64 | Unix 时间戳（毫秒） |
+| `code` | string | ETF 代码，如 `510050.SH` |
+| `last` | float32 | 最新价 |
+| `ask1` | float32 | 卖一价 |
+| `bid1` | float32 | 买一价 |
+| `askv1` | int32 | 卖一量（股，量级大故用 int32） |
+| `bidv1` | int32 | 买一量（股） |
+
+**快照文件（`snapshot_latest.parquet`）**：期权 + ETF 合并，每个合约只保留最新一条，Schema 为上述两表的超集，额外含 `type`（`"option"` / `"etf"`）列。
 - 宏观期限结构（`bond_termstructure_fetcher`）：
   - `D:\MARKET_DATA\macro\shibor\shibor_yieldcurve_YYYYMMDD.csv`（8 个 Shibor 期限，横表）
   - `D:\MARKET_DATA\macro\cgb_yield\cgb_yieldcurve_YYYYMMDD.csv`（17 个中债国债期限：0.0y～50y，横表）
@@ -255,7 +290,8 @@ xlsx 是 ZIP，`_load_topic_map()` 解析其中的 `xl/externalLinks/externalLin
 ## 最近变更
 
 - **Web Monitor 页面（`/monitor`）**：新增网页版 PCP 套利监控，`market-cache-monitor` 线程独立 ZMQ SUB（无 CONFLATE）+ 事件驱动，收到 tick 立即触发计算，aligner 增量更新（不再每轮 reset），数据延迟与终端 monitor 对齐；对应 WebSocket 端点 `/ws/monitor`
-- **DDE 数据流文档**：新增 `docs/dde_dataflow.md`（全链路说明）与 `docs/dde_no_excel_research.md`（脱离 Excel 直连可行性研究）
+- **DDE 数据流文档**：新增 `docs/dde_dataflow.md`（全链路说明）与 `docs/dde_no_excel_research.md`（脱离 Excel 直连可行性研究，补充"导出DDE菜单才是真实开门动作"机制分析）
+- **Parquet Schema 文档化**：README 新增期权、ETF、快照三张表的完整列定义；移除过时的 `docs/data_source_migration.md`
 - **IV 求解器：NR → Brent 法**：`VectorizedIVCalculator.calc_iv()` 由 Newton-Raphson 向量化迭代改为 `scipy.optimize.brentq` 逐合约求解，彻底消除深度虚值期权（Vega 极小）场景下的发散 `nan`
 - **GUARD-3 微观流动性防线**：`market_cache._compute_loop` 新增前置过滤，mid < 10 Tick 或价差 > max(20 Tick, mid×30%) 的合约 mid/bid/ask 三路同步置 `nan`，阻断废盘口进入 Brent 求解
 - **主力 IV 曲线（流动性拼接）**：`market_cache` 新增 `primary_ivs` 字段，按 K vs F 择优选用 OTM 侧 IV，平值附近按盘口价差取最紧侧；前端 vol_smile.html 以蓝色粗线展示，表格新增"主力 IV"列（含来源标注 C/P/AVG）
