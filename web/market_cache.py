@@ -17,7 +17,8 @@ import math
 import threading
 import time
 from collections import defaultdict
-from datetime import datetime, time as _time
+from datetime import datetime, time as _time, date, timedelta
+from utils.time_utils import trading_days_until
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -471,7 +472,7 @@ def _monitor_compute_loop() -> None:
         tmp_strategy_cfg_args = dict(
             min_profit=DEFAULT_MIN_PROFIT,
             expiry_days=DEFAULT_EXPIRY_DAYS,
-            atm_range_pct=0.20,
+            atm_range_pct=1.0,   # 与终端版一致：全量配对，显示由前端 n_each_side 控件筛选
             etf_prices=etf_prices,
         )
         strat, contract_mgr, active, pairs, option_codes, etf_codes = init_strategy_and_contracts(
@@ -574,7 +575,7 @@ def _monitor_compute_loop() -> None:
                 # ── 判断是否需要刷新 ────────────────────────────────
                 now = datetime.now()
                 elapsed = (now - last_scan).total_seconds()
-                should_refresh = msgs_recv > 0 or elapsed >= 3.0
+                should_refresh = msgs_recv > 0 or elapsed >= 2.0   # 与终端版 DEFAULT_REFRESH_SECS=2 对齐
                 if not should_refresh:
                     continue
 
@@ -591,7 +592,7 @@ def _monitor_compute_loop() -> None:
 
                 display_pairs = select_pairs_by_atm(pairs_for_scan, etf_view, n_each_side=0)
                 try:
-                    signals = strategy.scan_pairs_for_display(display_pairs)
+                    signals = strategy.scan_pairs_for_display(display_pairs, current_time=now)
                 except Exception as e:
                     logger.warning("market_cache_monitor: scan_pairs_for_display 异常: %s", e)
                     continue
@@ -607,6 +608,15 @@ def _monitor_compute_loop() -> None:
                     etf_price = etf_display.get(ul)
                     n_pairs_ul = sum(1 for p in (pairs or []) if p[0].underlying_code == ul)
                     sigs_sorted = sorted(sigs, key=lambda s: (s.expiry, s.multiplier, s.strike))
+                    today = now.date()
+                    expiry_info: Dict[str, Any] = {}
+                    for sig in sigs_sorted:
+                        exp_str = sig.expiry.strftime("%Y-%m-%d")
+                        if exp_str not in expiry_info:
+                            expiry_info[exp_str] = {
+                                "cal_days": (sig.expiry - today).days + 1,
+                                "trade_days": trading_days_until(sig.expiry, today),
+                            }
                     signals_out = []
                     for sig in sigs_sorted:
                         signals_out.append({
@@ -614,8 +624,8 @@ def _monitor_compute_loop() -> None:
                             "expiry": sig.expiry.strftime("%Y-%m-%d"),
                             "multiplier": sig.multiplier,
                             "is_adjusted": sig.is_adjusted,
-                            "net_profit": round(sig.net_profit_estimate, 1),
-                            "net_1tick": round(sig.net_1tick, 1) if sig.net_1tick is not None else None,
+                            "net_profit": int(round(sig.net_profit_estimate)),
+                            "net_1tick": int(round(sig.net_1tick)) if sig.net_1tick is not None else None,
                             "tolerance": round(sig.tolerance, 2) if sig.tolerance is not None else None,
                             "max_qty": round(sig.max_qty, 1) if sig.max_qty is not None else None,
                             "spread_ratio": round(sig.spread_ratio, 4) if sig.spread_ratio is not None else None,
@@ -633,6 +643,7 @@ def _monitor_compute_loop() -> None:
                         "n_quoted": len(sigs),
                         "n_positive": sum(1 for s in sigs if s.net_profit_estimate >= 0),
                         "signals": signals_out,
+                        "expiry_info": expiry_info,
                         "ivs": {},
                     }
 

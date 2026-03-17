@@ -36,8 +36,8 @@ python console.py
 
 ## 日常流程
 
-1. 打开 Wind 或通达信。
-2. 在控制台执行"抓取今日期权链"。
+1. 打开 无限易
+2. 在无限易中对所需合约选择导出DDE（真实开门机制，若已初始化无需再打开Excel）。
 3. 启动 DataBus（Wind 或 DDE）。
 4. 启动 Monitor。
 5. 收盘后执行"合并今日分片"并关闭进程。
@@ -289,6 +289,9 @@ xlsx 是 ZIP，`_load_topic_map()` 解析其中的 `xl/externalLinks/externalLin
 
 ## 最近变更
 
+- **Web Monitor 显示优化**：净利润/Net_1T 改为整数显示（与终端一致）；新增方向列（正向/空，三档配色）；IV 信息从独立行合并至表头（`MM-DD IV X.X%` 标签）；非净利润列统一黑色字体；净利润负值改为更浅灰色；各品种默认折叠；行高固定 26px 防抖动；正向/≥N元 加粗显示
+- **交易日计算后移后端**：`utils/time_utils` 新增 `trading_days_until()`（akshare 日历，回退工作日），`market_cache` 序列化时附加 `expiry_info`（自然日/交易日），前端不再自行计算；终端 monitor 私有函数提升为共用工具
+- **DDE 状态机重构**：`_DDEClient` 由逐字段攒 buf 触发改为永久状态机 + `_flush_dirty` 泵送后统一发送，支持无成交远月合约（只需有盘口），消除微观状态撕裂；BLANK/ERROR 回调写入哨兵值（askv1=0/ask1=999999 等）而非 NaN
 - **Web Monitor 页面（`/monitor`）**：新增网页版 PCP 套利监控，`market-cache-monitor` 线程独立 ZMQ SUB（无 CONFLATE）+ 事件驱动，收到 tick 立即触发计算，aligner 增量更新（不再每轮 reset），数据延迟与终端 monitor 对齐；对应 WebSocket 端点 `/ws/monitor`
 - **DDE 数据流文档**：新增 `docs/dde_dataflow.md`（全链路说明）与 `docs/dde_no_excel_research.md`（脱离 Excel 直连可行性研究，补充"导出DDE菜单才是真实开门动作"机制分析）
 - **Parquet Schema 文档化**：README 新增期权、ETF、快照三张表的完整列定义；移除过时的 `docs/data_source_migration.md`

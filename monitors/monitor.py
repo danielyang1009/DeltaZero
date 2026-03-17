@@ -33,7 +33,7 @@ from rich.rule import Rule
 from rich.table import Table
 from rich.text import Text
 
-from utils.time_utils import bj_today
+from utils.time_utils import bj_today, trading_days_until
 from monitors.common import (
     ETF_NAME_MAP,
     ETF_ORDER,
@@ -67,37 +67,6 @@ logging.basicConfig(
 # ──────────────────────────────────────────────────────────────────────
 # Rich 显示构建
 # ──────────────────────────────────────────────────────────────────────
-
-_TRADE_DATE_SET: Optional[set] = None
-
-
-def _get_trade_date_set() -> set:
-    """懒加载 A 股交易日历（akshare），失败时回退到纯工作日计算。"""
-    global _TRADE_DATE_SET
-    if _TRADE_DATE_SET is None:
-        try:
-            import akshare as ak
-            cal = ak.tool_trade_date_hist_sina()
-            _TRADE_DATE_SET = set(cal["trade_date"].tolist())  # datetime.date 对象
-        except Exception:
-            _TRADE_DATE_SET = set()  # 空集触发回退
-    return _TRADE_DATE_SET
-
-
-def _trading_days_until(expiry: date, today: date) -> int:
-    """从 today 到 expiry（含）的 A 股交易日数；无法获取日历时回退到工作日数。"""
-    trade_set = _get_trade_date_set()
-    count = 0
-    d = today
-    while d <= expiry:
-        if trade_set:
-            if d in trade_set:
-                count += 1
-        else:
-            if d.weekday() < 5:
-                count += 1
-        d += timedelta(days=1)
-    return count
 
 
 _ETF_BORDER = {
@@ -229,7 +198,7 @@ def _build_etf_table(
 
     for (expiry, mult), strikes in sorted(by_expiry_mult.items()):
         cal_days = (expiry - today).days + 1  # 含今天和到期日两端
-        trade_days = _trading_days_until(expiry, today)
+        trade_days = trading_days_until(expiry, today)
 
         # 居中 Rule 标题，含到期日、自然日、交易日、乘数
         rule_title = (

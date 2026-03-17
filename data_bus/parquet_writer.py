@@ -212,7 +212,7 @@ class ParquetWriter:
             self._etf_buffer.clear()
 
         total = 0
-        ts_str = dt.strftime("%Y%m%d_%H%M%S")
+        ts_str = dt.strftime("%H%M%S")
         date_str = dt.strftime("%Y%m%d")
 
         if opt_rows:

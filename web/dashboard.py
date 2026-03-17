@@ -65,7 +65,7 @@ async def _startup() -> None:
     global _update_queue, _monitor_queue, _event_loop
     _event_loop = asyncio.get_running_loop()
     _update_queue = asyncio.Queue(maxsize=2)
-    _monitor_queue = asyncio.Queue(maxsize=2)
+    _monitor_queue = asyncio.Queue(maxsize=5)
     start_market_cache(event_loop=_event_loop, update_queue=_update_queue, monitor_queue=_monitor_queue)
     asyncio.create_task(_ws_broadcaster())
     asyncio.create_task(_monitor_broadcaster())

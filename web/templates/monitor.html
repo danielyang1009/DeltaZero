@@ -20,19 +20,24 @@ h1{margin:0 0 12px;font-size:20px}
 .ul-header .toggle{font-size:11px;color:#94a3b8;min-width:12px}
 .ul-header .spot{color:#475569;font-weight:400}
 .ul-header .stats{color:#64748b;font-weight:400;margin-left:auto;font-size:12px;white-space:nowrap}
-.iv-bar{display:flex;flex-wrap:wrap;gap:8px;padding:7px 16px;background:#eff6ff;border-bottom:1px solid #dbeafe;font-size:12px;color:#1d4ed8}
-.iv-bar .iv-item{white-space:nowrap}
-.iv-bar .iv-item span{color:#64748b;margin-right:2px}
+.iv-inline{display:flex;flex-wrap:wrap;gap:6px;margin-left:12px}
+.iv-chip{font-size:11px;color:#1d4ed8;background:#eff6ff;border:1px solid #bfdbfe;border-radius:4px;padding:1px 6px;white-space:nowrap}
 .ul-body.collapsed{display:none}
 .group-sep{padding:5px 16px;background:#f8fafc;border-bottom:1px solid #e2e8f0;font-size:12px;color:#64748b;font-weight:500}
 table.sig-table{width:100%;border-collapse:collapse;font-size:12px}
 table.sig-table th{background:#f8fafc;padding:5px 8px;text-align:right;border-bottom:2px solid #e2e8f0;white-space:nowrap;font-weight:500;color:#475569}
 table.sig-table th:first-child{text-align:left}
-table.sig-table td{padding:4px 8px;text-align:right;border-bottom:1px solid #f1f5f9}
+table.sig-table tr{height:26px}
+table.sig-table td{padding:0 8px;text-align:right;border-bottom:1px solid #f1f5f9;line-height:26px;white-space:nowrap}
 table.sig-table td:first-child{text-align:left;font-weight:600}
-tr.profit-pos td{color:#16a34a;font-weight:600}
-tr.profit-zero td{color:#1a1a2e}
-tr.profit-neg td{color:#94a3b8}
+table.sig-table tbody td{color:#1a1a2e}
+tr.profit-pos td.profit-cell{color:#16a34a}
+tr.profit-zero td.profit-cell{color:#1a1a2e}
+tr.profit-neg td.profit-cell{color:#cbd5e1}
+tr.profit-pos td.dir-cell{color:#16a34a;font-weight:600}
+tr.profit-zero td.dir-cell{color:#1a1a2e}
+tr.profit-neg td.dir-cell{color:#cbd5e1}
+td.atm-strike{color:#ca8a04 !important;font-weight:700}
 </style>
 </head>
 <body>
@@ -46,8 +51,13 @@ tr.profit-neg td{color:#94a3b8}
     <input id="inpMinProfit" type="number" value="36" min="0" step="1"/>
   </span>
   <span>
-    <label>ATM 上下各（0=全部）</label>
-    <input id="inpNEachSide" type="number" value="0" min="0" step="1" max="20"/>
+    <label>ATM 上下各</label>
+    <select id="inpNEachSide">
+      <option value="0">全部</option>
+      <option value="3">3</option>
+      <option value="5">5</option>
+      <option value="10">10</option>
+    </select>
   </span>
   <span id="lastUpdate" style="font-size:12px;color:#94a3b8"></span>
 </div>
@@ -57,7 +67,7 @@ tr.profit-neg td{color:#94a3b8}
 <script>
 const UNDERLYINGS = ["510050.SH","510300.SH","510500.SH"];
 let _data = null;
-let _collapsed = {};
+let _collapsed = Object.fromEntries(["510050.SH","510300.SH","510500.SH"].map(u => [u, true]));
 let _rafPending = false;
 let _ws = null;
 let _reconnectTimer = null;
@@ -138,24 +148,24 @@ function doRender(){
     html += `<span class="stats">`;
     html += `配对: ${nPairs} &nbsp;|&nbsp; `;
     html += `有报价: ${nQuoted} &nbsp;|&nbsp; `;
-    html += `正向: ${nPositive} &nbsp;|&nbsp; `;
-    html += `≥${mp}元: <strong>${nAbove}</strong>`;
-    html += `</span></div>`;
+    html += `<strong>正向: ${nPositive}</strong> &nbsp;|&nbsp; `;
+    html += `<strong style="color:#16a34a">≥${mp}元: ${nAbove}</strong>`;
+    html += `</span>`;
 
-    // IV 行
     const ivs = ud.ivs || {};
     const ivKeys = Object.keys(ivs).sort();
     if(ivKeys.length){
-      html += `<div class="iv-bar">`;
+      html += `<span class="iv-inline">`;
       for(const exp of ivKeys){
         const iv = ivs[exp];
-        const td = iv.T_days != null ? `${iv.T_days}d` : "";
         const ivPct = (iv.atm_iv * 100).toFixed(1) + "%";
         const expShort = exp.slice(5);  // MM-DD
-        html += `<span class="iv-item"><span>${expShort}(${td})</span>${ivPct}</span>`;
+        html += `<span class="iv-chip">${expShort} IV ${ivPct}</span>`;
       }
-      html += `</div>`;
+      html += `</span>`;
     }
+
+    html += `</div>`;
 
     // 正文（可折叠）
     html += `<div class="ul-body${collapsed ? " collapsed" : ""}">`;
@@ -164,6 +174,7 @@ function doRender(){
       html += `<div style="padding:12px 16px;color:#94a3b8;font-size:12px">暂无数据</div>`;
     } else {
       // 按 (expiry, multiplier) 分组
+      const expiry_info = ud.expiry_info || {};
       const groups = {};
       for(const sig of filtered){
         const gk = sig.expiry + "|" + sig.multiplier;
@@ -173,7 +184,7 @@ function doRender(){
 
       html += `<table class="sig-table">`;
       html += `<thead><tr>`;
-      html += `<th>行权价</th><th>净利润</th><th>Net_1T</th><th>TOL</th>`;
+      html += `<th>行权价</th><th>方向</th><th>净利润</th><th>Net_1T</th><th>TOL</th>`;
       html += `<th>Max_Qty</th><th>SPRD</th><th>OBI_C</th><th>OBI_P</th><th>OBI_S</th>`;
       html += `<th>C_bid</th><th>P_ask</th><th>S_ask</th>`;
       html += `</tr></thead><tbody>`;
@@ -181,16 +192,27 @@ function doRender(){
       for(const gk of Object.keys(groups)){
         const g = groups[gk];
         const adjLabel = g.is_adjusted ? ` [调整×${g.multiplier}]` : ` [×${g.multiplier}]`;
-        html += `<tr><td colspan="12" style="padding:0"><div class="group-sep">${g.expiry}${adjLabel}</div></td></tr>`;
+        const ei = expiry_info[g.expiry];
+        const daysLabel = ei
+          ? `<span style="color:#94a3b8;font-weight:400;margin-left:8px">自然日 ${ei.cal_days}天 &nbsp;交易日 ${ei.trade_days}天</span>`
+          : "";
+        html += `<tr><td colspan="13" style="padding:0"><div class="group-sep">${g.expiry}${adjLabel}${daysLabel}</div></td></tr>`;
+        const strikes = [...new Set(g.rows.map(r => r.strike))].sort((a,b) => a-b);
+        const atmStrike = spot > 0 && strikes.length
+          ? strikes.reduce((a,b) => Math.abs(b-spot) < Math.abs(a-spot) ? b : a)
+          : null;
         for(const sig of g.rows){
           let rowClass = "profit-neg";
           if(sig.net_profit >= mp)     rowClass = "profit-pos";
           else if(sig.net_profit >= 0) rowClass = "profit-zero";
+          const isAtm = atmStrike !== null && sig.strike === atmStrike;
 
+          const dirStr = sig.net_profit >= mp ? "正向" : (sig.net_profit >= 0 ? "正向" : "");
           html += `<tr class="${rowClass}">`;
-          html += `<td>${fmt(sig.strike,4)}</td>`;
-          html += `<td>${fmt(sig.net_profit,1)}</td>`;
-          html += `<td>${fmt(sig.net_1tick,1)}</td>`;
+          html += `<td${isAtm ? ' class="atm-strike"' : ''}>${fmt(sig.strike,4)}</td>`;
+          html += `<td class="dir-cell">${dirStr}</td>`;
+          html += `<td class="profit-cell">${fmt(sig.net_profit,0)}</td>`;
+          html += `<td>${fmt(sig.net_1tick,0)}</td>`;
           html += `<td>${fmt(sig.tolerance,2)}</td>`;
           html += `<td>${fmt(sig.max_qty,1)}</td>`;
           html += `<td>${sig.spread_ratio!=null?(sig.spread_ratio*100).toFixed(1)+"%":"—"}</td>`;
@@ -219,7 +241,7 @@ function toggleCard(ul){
 }
 
 document.getElementById("inpMinProfit").addEventListener("input", scheduleRender);
-document.getElementById("inpNEachSide").addEventListener("input", scheduleRender);
+document.getElementById("inpNEachSide").addEventListener("change", scheduleRender);
 
 function connect(){
   if(_reconnectTimer){ clearTimeout(_reconnectTimer); _reconnectTimer = null; }
