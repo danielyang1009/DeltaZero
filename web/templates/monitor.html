@@ -35,7 +35,7 @@ h1{margin:0 0 12px;font-size:20px}
 .grp-body{overflow-x:auto;padding:0 48px}
 .grp-body.collapsed{display:none}
 
-table.sig-table{width:100%;border-collapse:collapse;font-size:12px}
+table.sig-table{width:100%;border-collapse:collapse;font-size:12px;table-layout:fixed}
 table.sig-table th{background:none;padding:5px 8px;text-align:right;border-bottom:2px solid #e2e8f0;white-space:nowrap;font-weight:400;color:#1a1a2e}
 table.sig-table th:first-child{text-align:left}
 table.sig-table th:nth-child(2){text-align:left}
@@ -239,9 +239,9 @@ function doRender(){
         // ── 层级 2 正文（表格）───────────────────────────────────
         html += `<div class="grp-body${grpColl ? " collapsed" : ""}">`;
         html += `<table class="sig-table"><thead><tr>`;
-        html += `<th>行权价</th><th>方向</th><th>净利润</th><th>Net_1T</th><th>TOL</th>`;
-        html += `<th>Max_Qty</th><th>SPRD</th><th>OBI_C</th><th>OBI_P</th><th>OBI_S</th>`;
-        html += `<th>C_bid</th><th>P_ask</th><th>S_ask</th>`;
+        html += `<th style="width:68px">行权价</th><th style="width:44px">方向</th><th style="width:60px">净利润</th><th style="width:54px">Net_1T</th><th style="width:48px">TOL</th>`;
+        html += `<th style="width:56px">Max_Qty</th><th style="width:52px">SPRD</th><th style="width:52px">OBI_C</th><th style="width:52px">OBI_P</th><th style="width:52px">OBI_S</th>`;
+        html += `<th style="width:60px">C_bid</th><th style="width:60px">P_ask</th><th style="width:60px">S_ask</th>`;
         html += `</tr></thead><tbody>`;
 
         for(const sig of g.rows){
