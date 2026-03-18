@@ -27,17 +27,18 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 from models import (
+    ArbitrageSignal,
     ContractInfo,
     ETFTickData,
     OptionType,
     SignalType,
     TickData,
-    TradeSignal,
     normalize_code,
 )
 from config.settings import ETF_CODE_TO_NAME, UNDERLYINGS, TradingConfig, get_default_config
 from data_engine.contract_catalog import ContractInfoManager, get_optionchain_path
-from strategies.pcp_arbitrage import PCPArbitrage
+from data_engine.tick_aligner import TickAligner
+from strategies.pcp_arbitrage import PCPArbitrageStrategy
 
 logger = logging.getLogger(__name__)
 
@@ -169,7 +170,7 @@ def build_pairs_and_codes(
 # ══════════════════════════════════════════════════════════════════════
 
 def restore_from_snapshot(
-    strategy: PCPArbitrage,
+    aligner: TickAligner,
     snapshot_dir: str,
     etf_prices: Dict[str, float],
 ) -> int:
@@ -216,7 +217,7 @@ def restore_from_snapshot(
                     bid_volume=_safe_int(row.get("bidv1")),
                     is_simulated=False,
                 )
-                strategy.on_etf_tick(tick)
+                aligner.update_etf(tick)
                 if last > 0:
                     etf_prices[code] = last
             else:
@@ -238,7 +239,7 @@ def restore_from_snapshot(
                     bid_prices=[bid1] + [math.nan] * 4,
                     bid_volumes=[bidv1] + [0] * 4,
                 )
-                strategy.on_option_tick(tick)
+                aligner.update_option(tick)
             count += 1
         except Exception:
             continue
@@ -328,21 +329,18 @@ def estimate_etf_fallback_prices(
 # 信号序列化
 # ══════════════════════════════════════════════════════════════════════
 
-def signal_to_dict(sig: TradeSignal) -> dict:
-    """将 TradeSignal 序列化为前端友好的字典。"""
+def signal_to_dict(sig: ArbitrageSignal) -> dict:
+    """将 ArbitrageSignal 序列化为前端友好的字典。"""
     return {
         "expiry": sig.expiry.strftime("%m-%d"),
         "strike": sig.strike,
-        "direction": "正向" if sig.signal_type == SignalType.FORWARD else "反向",
-        "is_forward": sig.signal_type == SignalType.FORWARD,
+        "direction": "正向" if sig.direction == SignalType.FORWARD else "反向",
+        "is_forward": sig.direction == SignalType.FORWARD,
         "call_bid": sig.call_bid,
-        "call_ask": sig.call_ask,
-        "put_bid": sig.put_bid,
         "put_ask": sig.put_ask,
-        "spot": sig.spot_price,
-        "profit": round(sig.net_profit_estimate, 0),
-        "confidence": round(sig.confidence, 2),
-        "underlying": sig.underlying_code,
+        "spot": sig.spot_ask,
+        "profit": round(sig.net_profit, 0),
+        "underlying": sig.underlying,
         "call_code": sig.call_code,
         "put_code": sig.put_code,
         "multiplier": sig.multiplier,
@@ -350,9 +348,9 @@ def signal_to_dict(sig: TradeSignal) -> dict:
         "calc_detail": sig.calc_detail,
         "max_qty": sig.max_qty,
         "spread_ratio": sig.spread_ratio,
-        "obi_c": sig.obi_c,
-        "obi_s": sig.obi_s,
-        "obi_p": sig.obi_p,
+        "obi_c": sig.obi_call,
+        "obi_s": sig.obi_spot,
+        "obi_p": sig.obi_put,
         "net_1tick": sig.net_1tick,
         "tolerance": sig.tolerance,
     }
@@ -416,7 +414,7 @@ def init_strategy_and_contracts(
     include_interest: bool = False,
     log_fn=None,
 ) -> Tuple[
-    PCPArbitrage,
+    PCPArbitrageStrategy,
     ContractInfoManager,
     List[ContractInfo],
     List[Tuple[ContractInfo, ContractInfo]],
@@ -440,7 +438,7 @@ def init_strategy_and_contracts(
     config.etf_fee_rate = etf_fee_rate
     config.option_round_trip_fee = option_round_trip_fee
     config.include_interest = include_interest
-    strategy = PCPArbitrage(config)
+    strategy = PCPArbitrageStrategy(config)
 
     contract_mgr = ContractInfoManager()
     optionchain_csv = get_optionchain_path(target_date=date.today())

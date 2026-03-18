@@ -22,7 +22,7 @@ ETF 期权 PCP 套利工具，采用四层流水线结构：
 |----|------|------|
 | 数据采集 | `data_bus/bus.py` | 消费 `DDEDirectSubscriber` 的 tick，写 Parquet 分片，同时 ZMQ PUB 广播 |
 | 数据总线 | ZMQ PUB 5555 | 统一消息格式：`OPT_` / `ETF_` 前缀；每 30 秒刷盘，15:10 自动日终合并 |
-| 消费层 | `monitors/monitor.py` | ZMQ SUB → `PCPArbitrage.scan_pairs_for_display()` → Rich 终端表格 |
+| 消费层 | `monitors/monitor.py` | ZMQ SUB → `TickAligner` + `PCPArbitrageStrategy.scan_pairs_for_display()` → Rich 终端表格 |
 | 消费层 | `web/market_cache.py` | ZMQ SUB（CONFLATE=1）→ LKV → 每 100ms Brent 法 IV → asyncio Queue → WS 推送 |
 
 ## 快速启动
@@ -284,6 +284,9 @@ xlsx 是 ZIP，`_load_topic_map()` 解析其中的 `xl/externalLinks/externalLin
 
 ## 最近变更
 
+- **架构重构（Phase 3/4）**：`TickAligner`（`data_engine/tick_aligner.py`）独立为市场状态容器，`PCPArbitrageStrategy`（`strategies/pcp_arbitrage.py`）改为无状态策略，接收 `MarketSnapshot` 作为输入；信号类型由 `TradeSignal` 升级为 `ArbitrageSignal`；`monitors/monitor.py` 与 `web/market_cache.py` 均已迁移至新架构
+- **models 包重组**：`models.py` 拆分为 `models/data.py`（市场数据类）和 `models/order.py`（信号/订单类），顶层 `models/__init__.py` 保持向后兼容，原有 `from models import ...` 语句无需修改
+- **回测引擎解耦**：`backtest/engine.py` 精简为编排层，撮合逻辑迁至 `backtest/portfolio.py`，数据流生成迁至 `backtest/data_feed.py`；`run()` 接口签名不变
 - **移除 Wind 数据源**：删除 `WindSubscriber`、`WindAdapter`、`wind_helpers`、`optionchain_fetcher`；DataBus 仅保留 DDE 模式，`--source` 参数只接受 `dde`；控制台移除"抓取期权链"入口
 - **DataBus 开盘 tick 保全**：`bus.py` 主循环改为每条 tick 独立取实时墙钟判断交易时段，消除批量处理 1000 条时 9:30:00 边界处的竞态窗口；**建议每日 9:25 前启动 DataBus**
 - **Web Monitor 二级折叠**：表格新增"到期日+合约类型"层级折叠（默认展开），方向列改为左对齐

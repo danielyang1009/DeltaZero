@@ -46,13 +46,14 @@ from monitors.common import (
 )
 from config.settings import DEFAULT_MARKET_DATA_DIR, DEFAULT_MIN_PROFIT, DEFAULT_EXPIRY_DAYS, DEFAULT_N_EACH_SIDE, DEFAULT_REFRESH_SECS, UNDERLYINGS
 from models import (
+    ArbitrageSignal,
     ContractInfo,
     ETFTickData,
-    TradeSignal,
 )
 from calculators.vix_engine import VIXEngine, VIXResult
 from calculators.yield_curve import BoundedCubicSplineRate
-from strategies.pcp_arbitrage import PCPArbitrage
+from strategies.pcp_arbitrage import PCPArbitrageStrategy
+from data_engine.tick_aligner import TickAligner
 
 console = Console(legacy_windows=False, highlight=True)
 
@@ -80,7 +81,7 @@ _VIX_TARGETS = list(UNDERLYINGS)
 
 def _build_etf_table(
     underlying: str,
-    sigs: List[TradeSignal],
+    sigs: List[ArbitrageSignal],
     display_pairs_u: List[Tuple[ContractInfo, ContractInfo]],
     price: float,
     min_profit: float,
@@ -93,7 +94,7 @@ def _build_etf_table(
 ) -> Panel:
     """为单个品种构建信号面板，每个到期日组显示跨列全宽横幅标题。"""
     u_name = ETF_NAME_MAP.get(underlying.split(".")[0], underlying)
-    n_profitable_val = sum(1 for s in sigs if s.net_profit_estimate >= min_profit)
+    n_profitable_val = sum(1 for s in sigs if s.net_profit >= min_profit)
     border = "bright_green" if n_profitable_val > 0 else (_ETF_BORDER.get(underlying, "dim") if sigs else "dim")
 
     # 面板标题：品种名、价格、VIX
@@ -137,8 +138,8 @@ def _build_etf_table(
         # 乘数列已移至每组 Rule 标题，此处不再单独列出
         return tbl
 
-    def _add_sig_row(tbl: Table, sig: TradeSignal, *, is_atm: bool = False) -> None:
-        profit = sig.net_profit_estimate
+    def _add_sig_row(tbl: Table, sig: ArbitrageSignal, *, is_atm: bool = False) -> None:
+        profit = sig.net_profit
         if profit >= min_profit:
             profit_str = f"[bold green]{profit:.0f}[/bold green]"
             dir_str = "[bold green]正向[/bold green]"
@@ -160,12 +161,12 @@ def _build_etf_table(
             f"{sig.tolerance:.2f}" if sig.tolerance is not None else "--",
             f"{sig.max_qty:.2f}" if sig.max_qty is not None else "--",
             f"{sig.spread_ratio * 100:.1f}%" if sig.spread_ratio is not None else "--",
-            f"{sig.obi_c:.2f}" if sig.obi_c is not None else "--",
-            f"{sig.obi_p:.2f}" if sig.obi_p is not None else "--",
-            f"{sig.obi_s:.2f}" if sig.obi_s is not None else "--",
+            f"{sig.obi_call:.2f}" if sig.obi_call is not None else "--",
+            f"{sig.obi_put:.2f}" if sig.obi_put is not None else "--",
+            f"{sig.obi_spot:.2f}" if sig.obi_spot is not None else "--",
             f"{sig.call_bid:.4f}",
             f"{sig.put_ask:.4f}",
-            f"{sig.spot_price:.4f}",
+            f"{sig.spot_ask:.4f}",
         )
 
     if not display_pairs_u:
@@ -176,8 +177,8 @@ def _build_etf_table(
 
     today = bj_today()
 
-    # 建立信号查找表：(expiry, multiplier, strike) -> TradeSignal
-    sig_map: Dict[Tuple[date, int, float], TradeSignal] = {}
+    # 建立信号查找表：(expiry, multiplier, strike) -> ArbitrageSignal
+    sig_map: Dict[Tuple[date, int, float], ArbitrageSignal] = {}
     for sig in sigs:
         sig_map[(sig.expiry, sig.multiplier, sig.strike)] = sig
 
@@ -234,7 +235,7 @@ def _build_etf_table(
 
 
 def build_display(
-    all_display_signals: List[TradeSignal],
+    all_display_signals: List[ArbitrageSignal],
     ts: datetime,
     etf_prices: Dict[str, float],
     vix_values: Dict[str, Optional[float]],
@@ -254,9 +255,9 @@ def build_display(
     )
 
     # 信号按品种分组
-    sig_groups: Dict[str, List[TradeSignal]] = defaultdict(list)
+    sig_groups: Dict[str, List[ArbitrageSignal]] = defaultdict(list)
     for sig in all_display_signals:
-        sig_groups[sig.underlying_code].append(sig)
+        sig_groups[sig.underlying].append(sig)
 
     # display_pairs 按品种分组
     pair_groups: Dict[str, List[Tuple[ContractInfo, ContractInfo]]] = defaultdict(list)
@@ -271,8 +272,8 @@ def build_display(
         u_pairs = pair_groups.get(u, [])
         n_pairs_u = len({(p[0].expiry_date, p[0].contract_unit, p[0].strike_price) for p in u_pairs})
         n_opts_u = 2 * n_pairs_u
-        n_positive_u = sum(1 for s in u_sigs if s.net_profit_estimate >= 0)
-        n_profitable_u = sum(1 for s in u_sigs if s.net_profit_estimate >= min_profit)
+        n_positive_u = sum(1 for s in u_sigs if s.net_profit >= 0)
+        n_profitable_u = sum(1 for s in u_sigs if s.net_profit >= min_profit)
         tables.append(
             _build_etf_table(
                 u, u_sigs, u_pairs, etf_px, min_profit, vix_values.get(u),
@@ -312,15 +313,8 @@ def run_monitor(
     etf_prices: Dict[str, float] = {}
 
     # 从快照恢复
-    n_snap = 0
-    from config.settings import get_default_config
-    tmp_config = get_default_config()
-    tmp_config.min_profit_threshold = min_profit
-    tmp_config.etf_fee_rate = etf_fee_rate
-    tmp_config.option_round_trip_fee = option_one_side_fee * 2
-    tmp_config.include_interest = include_interest
-    tmp_strategy = PCPArbitrage(tmp_config)
-    n_snap = restore_from_snapshot(tmp_strategy, snapshot_dir, etf_prices)
+    aligner = TickAligner()
+    n_snap = restore_from_snapshot(aligner, snapshot_dir, etf_prices)
     if n_snap:
         console.print(f"[green]已从快照恢复 {n_snap} 条 tick[/green]")
     else:
@@ -339,9 +333,6 @@ def run_monitor(
     except (FileNotFoundError, RuntimeError) as e:
         console.print(f"[red]{e}[/red]")
         return
-
-    if n_snap > 0:
-        restore_from_snapshot(strategy, snapshot_dir, etf_prices)
 
     ctx = zmq.Context.instance()
     sock = ctx.socket(zmq.SUB)
@@ -362,7 +353,7 @@ def run_monitor(
 
     iteration = 0
     last_scan = datetime.now()
-    last_signals: List[TradeSignal] = []
+    last_signals: List[ArbitrageSignal] = []
     etf_display = dict(etf_prices)
     no_data_cycles = 0  # 连续未收到 ZMQ 消息的刷新次数
     # 仅展示“当前实时流里出现过”的标的，避免历史快照把未订阅品种带出来
@@ -422,12 +413,11 @@ def run_monitor(
 
                     tick = parse_zmq_message(raw)
                     if tick is not None:
+                        aligner.update_tick(tick)
                         if isinstance(tick, ETFTickData):
-                            strategy.on_etf_tick(tick)
                             etf_display[tick.etf_code] = tick.price
                             stream_underlyings.add(tick.etf_code)
                         else:
-                            strategy.on_option_tick(tick)
                             info = contract_mgr.get_info(tick.contract_code)
                             if info is not None:
                                 stream_underlyings.add(info.underlying_code)
@@ -450,11 +440,11 @@ def run_monitor(
                         etf_display_view = etf_display
 
                     display_pairs = select_pairs_by_atm(pairs_for_scan, etf_display_view, n_each_side)
-                    last_signals = strategy.scan_pairs_for_display(display_pairs, current_time=now)
+                    last_signals = strategy.scan_pairs_for_display(aligner.snapshot(), display_pairs, current_time=now)
                     for u in [x for x in _VIX_TARGETS if x in etf_display_view]:
                         result = vix_engine.compute_for_underlying(
                             vix_pairs_by_underlying.get(u, []),
-                            strategy.aligner,
+                            aligner,
                             now,
                             last_result=vix_last.get(u),
                             enable_republication=True,

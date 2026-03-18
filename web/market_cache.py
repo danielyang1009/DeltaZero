@@ -436,9 +436,14 @@ def _compute_loop() -> None:
 
 def _monitor_compute_loop() -> None:
     """
-    后台 PCP 套利计算线程（Thread-3）：事件驱动，对齐终端 monitor 架构。
+    后台 PCP 套利计算线程（Thread-3，Phase 3 重构版）
 
-    数据流：独立 ZMQ SUB（无CONFLATE）→ 增量 on_etf_tick/on_option_tick → scan → asyncio.Queue
+    架构变更：
+      旧：strategy.on_xxx_tick(tick) → strategy.scan_pairs_for_display(pairs)
+      新：aligner.update_tick(tick)  → pcp_strategy.scan_pairs_for_display(snapshot, pairs)
+
+    数据流：独立 ZMQ SUB（无CONFLATE）→ TickAligner 更新 LKV → PCPArbitrageStrategy.scan
+         → asyncio.Queue → WebSocket 推送
     顶层 try-except 确保任何未捕获异常只记录日志，线程不会静默退出。
     """
     try:
@@ -450,13 +455,15 @@ def _monitor_compute_loop() -> None:
     from config.settings import UNDERLYINGS, ETF_CODE_TO_NAME, DEFAULT_EXPIRY_DAYS, DEFAULT_MIN_PROFIT
     from monitors.common import (
         init_strategy_and_contracts, select_pairs_by_atm,
-        parse_zmq_message, restore_from_snapshot,
+        parse_zmq_message,
     )
-    from data_engine.contract_catalog import get_optionchain_path, ContractInfoManager
+    from data_engine.contract_catalog import get_optionchain_path
+    from data_engine.tick_aligner import TickAligner as _TickAligner
     from models import ETFTickData
+    from strategies.pcp_arbitrage import PCPArbitrageStrategy
 
-    # ── 策略初始化（含冷启动快照恢复）──────────────────────────────────
-    def _init_strategy():
+    # ── 初始化（仅加载合约元数据，不创建旧 PCPArbitrage）──────────────
+    def _init_components():
         snap = get_snapshot()
         etf_prices: Dict[str, float] = {}
         for code, rec in snap.items():
@@ -468,31 +475,33 @@ def _monitor_compute_loop() -> None:
         path = get_optionchain_path()
         mtime = path.stat().st_mtime if path.exists() else None
 
-        # 第一次 restore：用空策略预热 etf_prices（与终端 monitor 一致）
-        tmp_strategy_cfg_args = dict(
-            min_profit=DEFAULT_MIN_PROFIT,
-            expiry_days=DEFAULT_EXPIRY_DAYS,
-            atm_range_pct=1.0,   # 与终端版一致：全量配对，显示由前端 n_each_side 控件筛选
-            etf_prices=etf_prices,
+        # 用 init_strategy_and_contracts 只取合约元数据（忽略返回的旧 PCPArbitrage 实例）
+        from config.settings import get_default_config
+        _strat_unused, contract_mgr, active, pairs, option_codes, etf_codes = (
+            init_strategy_and_contracts(
+                min_profit=DEFAULT_MIN_PROFIT,
+                expiry_days=DEFAULT_EXPIRY_DAYS,
+                atm_range_pct=1.0,
+                etf_prices=etf_prices,
+            )
         )
-        strat, contract_mgr, active, pairs, option_codes, etf_codes = init_strategy_and_contracts(
-            **tmp_strategy_cfg_args
-        )
-        restore_from_snapshot(strat, _snapshot_dir, etf_prices)
 
-        # 第二次 restore：正式填充 aligner
-        restore_from_snapshot(strat, _snapshot_dir, etf_prices)
-        logger.info("market_cache_monitor: 策略初始化成功，配对 %d 组", len(pairs))
-        return strat, contract_mgr, pairs, etf_prices, mtime
+        # Phase 3：创建新架构的状态引擎 + 无状态策略
+        aligner  = _TickAligner()
+        pcp      = PCPArbitrageStrategy(get_default_config())
 
-    strategy = None
-    contract_mgr = None
-    pairs = None
+        logger.info("market_cache_monitor: 初始化成功，配对 %d 组", len(pairs))
+        return pcp, aligner, contract_mgr, pairs, etf_prices, mtime
+
+    pcp_strategy   = None
+    aligner        = None
+    contract_mgr   = None
+    pairs          = None
     optionchain_mtime = None
     mtime_check_ts = 0.0
-    sock = None
+    sock           = None
 
-    # 等待 LKV 有数据后再初始化（避免首次启动 etf_prices 为空）
+    # 等待 LKV 有数据后再初始化
     _init_wait = 0
     while _running and not get_snapshot():
         time.sleep(0.5)
@@ -502,16 +511,18 @@ def _monitor_compute_loop() -> None:
 
     while _running:
         # ── 首次 / 文件变更后初始化 ────────────────────────────────
-        if strategy is None:
+        if pcp_strategy is None:
             try:
-                strategy, contract_mgr, pairs, etf_display, optionchain_mtime = _init_strategy()
+                pcp_strategy, aligner, contract_mgr, pairs, etf_display, optionchain_mtime = (
+                    _init_components()
+                )
                 mtime_check_ts = time.time()
             except Exception as e:
-                logger.warning("market_cache_monitor: 策略初始化失败: %s，5s 后重试", e)
+                logger.warning("market_cache_monitor: 初始化失败: %s，5s 后重试", e)
                 time.sleep(5.0)
                 continue
 
-            # 建立独立 ZMQ SUB socket（无 CONFLATE）
+            # 建立独立 ZMQ SUB socket（无 CONFLATE，需要每条都处理）
             if sock is not None:
                 try:
                     sock.close(linger=0)
@@ -529,8 +540,9 @@ def _monitor_compute_loop() -> None:
 
         stream_underlyings: set = set()
         last_scan = datetime.now()
+        etf_display: Dict[str, float] = {}   # etf_code → last price（用于 ATM 筛选）
 
-        while _running and strategy is not None:
+        while _running and pcp_strategy is not None:
             try:
                 # ── 每 60s 检查 optionchain 文件变更 ──────────────
                 now_ts = time.time()
@@ -541,12 +553,13 @@ def _monitor_compute_loop() -> None:
                         mtime = path.stat().st_mtime if path.exists() else None
                         if mtime != optionchain_mtime:
                             logger.info("market_cache_monitor: optionchain 已变更，触发重新初始化")
-                            strategy = None
+                            pcp_strategy = None
                             break
                     except Exception:
                         pass
 
                 # ── 批量接收 ZMQ 消息（最多 200 条/cycle）──────────
+                # Phase 3：用 aligner.update_tick(tick) 替代旧的 strategy.on_xxx_tick(tick)
                 msgs_recv = 0
                 while msgs_recv < 200:
                     try:
@@ -556,16 +569,19 @@ def _monitor_compute_loop() -> None:
                     except Exception as e:
                         logger.warning("market_cache_monitor: ZMQ recv 错误: %s", e)
                         break
+
                     tick = parse_zmq_message(raw)
                     if tick is None:
                         msgs_recv += 1
                         continue
+
+                    # ── 核心变更：更新 TickAligner，不再调用 strategy.on_xxx_tick ──
+                    aligner.update_tick(tick)
+
                     if isinstance(tick, ETFTickData):
-                        strategy.on_etf_tick(tick)
                         etf_display[tick.etf_code] = tick.price
                         stream_underlyings.add(tick.etf_code)
                     else:
-                        strategy.on_option_tick(tick)
                         if contract_mgr is not None:
                             info = contract_mgr.contracts.get(tick.contract_code)
                             if info:
@@ -575,7 +591,7 @@ def _monitor_compute_loop() -> None:
                 # ── 判断是否需要刷新 ────────────────────────────────
                 now = datetime.now()
                 elapsed = (now - last_scan).total_seconds()
-                should_refresh = msgs_recv > 0 or elapsed >= 2.0   # 与终端版 DEFAULT_REFRESH_SECS=2 对齐
+                should_refresh = msgs_recv > 0 or elapsed >= 2.0
                 if not should_refresh:
                     continue
 
@@ -590,17 +606,31 @@ def _monitor_compute_loop() -> None:
                     pairs_for_scan = list(pairs or [])
                     etf_view = dict(etf_display)
 
-                display_pairs = select_pairs_by_atm(pairs_for_scan, etf_view, n_each_side=0)
+                display_pairs  = select_pairs_by_atm(pairs_for_scan, etf_view, n_each_side=0)
+                snapshot       = aligner.snapshot()
+
+                # ── 核心变更：传入 snapshot 调用无状态策略 ────────────
                 try:
-                    signals = strategy.scan_pairs_for_display(display_pairs, current_time=now)
+                    signals = pcp_strategy.scan_pairs_for_display(
+                        snapshot, display_pairs, current_time=now,
+                    )
                 except Exception as e:
                     logger.warning("market_cache_monitor: scan_pairs_for_display 异常: %s", e)
                     continue
 
-                # ── 序列化 ────────────────────────────────────────
+                # ── 序列化（适配 ArbitrageSignal 字段名）───────────────
+                # ArbitrageSignal 字段与旧 TradeSignal 的差异：
+                #   sig.underlying     (旧: sig.underlying_code)
+                #   sig.net_profit     (旧: sig.net_profit_estimate)
+                #   sig.obi_call       (旧: sig.obi_c)
+                #   sig.obi_spot       (旧: sig.obi_s)
+                #   sig.obi_put        (旧: sig.obi_p)
+                #   sig.call_bid       (新增，直接可用)
+                #   sig.put_ask        (新增，直接可用)
+                #   sig.spot_ask       (新增，直接可用)
                 ul_groups: Dict[str, list] = {}
                 for sig in signals:
-                    ul_groups.setdefault(sig.underlying_code, []).append(sig)
+                    ul_groups.setdefault(sig.underlying, []).append(sig)
 
                 underlyings_data: Dict[str, Any] = {}
                 for ul in UNDERLYINGS:
@@ -614,34 +644,34 @@ def _monitor_compute_loop() -> None:
                         exp_str = sig.expiry.strftime("%Y-%m-%d")
                         if exp_str not in expiry_info:
                             expiry_info[exp_str] = {
-                                "cal_days": (sig.expiry - today).days + 1,
+                                "cal_days":   (sig.expiry - today).days + 1,
                                 "trade_days": trading_days_until(sig.expiry, today),
                             }
                     signals_out = []
                     for sig in sigs_sorted:
                         signals_out.append({
-                            "strike": sig.strike,
-                            "expiry": sig.expiry.strftime("%Y-%m-%d"),
-                            "multiplier": sig.multiplier,
+                            "strike":      sig.strike,
+                            "expiry":      sig.expiry.strftime("%Y-%m-%d"),
+                            "multiplier":  sig.multiplier,
                             "is_adjusted": sig.is_adjusted,
-                            "net_profit": int(round(sig.net_profit_estimate)),
-                            "net_1tick": int(round(sig.net_1tick)) if sig.net_1tick is not None else None,
-                            "tolerance": round(sig.tolerance, 2) if sig.tolerance is not None else None,
-                            "max_qty": round(sig.max_qty, 1) if sig.max_qty is not None else None,
-                            "spread_ratio": round(sig.spread_ratio, 4) if sig.spread_ratio is not None else None,
-                            "obi_c": round(sig.obi_c, 3) if sig.obi_c is not None else None,
-                            "obi_s": round(sig.obi_s, 3) if sig.obi_s is not None else None,
-                            "obi_p": round(sig.obi_p, 3) if sig.obi_p is not None else None,
-                            "call_bid": sig.call_bid,
-                            "put_ask": sig.put_ask,
-                            "spot_ask": sig.spot_price,
+                            "net_profit":  int(round(sig.net_profit)),          # ← sig.net_profit
+                            "net_1tick":   int(round(sig.net_1tick))  if sig.net_1tick   is not None else None,
+                            "tolerance":   round(sig.tolerance, 2)    if sig.tolerance   is not None else None,
+                            "max_qty":     round(sig.max_qty, 1)       if sig.max_qty     is not None else None,
+                            "spread_ratio":round(sig.spread_ratio, 4)  if sig.spread_ratio is not None else None,
+                            "obi_c":       round(sig.obi_call, 3)      if sig.obi_call    is not None else None,  # ← obi_call
+                            "obi_s":       round(sig.obi_spot, 3)      if sig.obi_spot    is not None else None,  # ← obi_spot
+                            "obi_p":       round(sig.obi_put, 3)       if sig.obi_put     is not None else None,  # ← obi_put
+                            "call_bid":    sig.call_bid,
+                            "put_ask":     sig.put_ask,
+                            "spot_ask":    sig.spot_ask,                         # ← spot_ask
                         })
                     underlyings_data[ul] = {
                         "name": ETF_CODE_TO_NAME.get(ul, ul),
                         "spot": round(etf_price, 4) if etf_price else None,
                         "n_pairs": n_pairs_ul,
                         "n_quoted": len(sigs),
-                        "n_positive": sum(1 for s in sigs if s.net_profit_estimate >= 0),
+                        "n_positive": sum(1 for s in sigs if s.net_profit >= 0),
                         "signals": signals_out,
                         "expiry_info": expiry_info,
                         "ivs": {},
