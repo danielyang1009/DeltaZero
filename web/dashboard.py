@@ -26,8 +26,6 @@ from web.market_cache import get_snapshot, get_rich_snapshot, get_monitor_cache,
 from web.data_stats import (
     chunks_readable,
     count_today_chunks,
-    get_fetch_state,
-    launch_fetch_task,
     merge_status_readable,
     read_snapshot_stats,
     run_merge,
@@ -433,7 +431,7 @@ class MonitorStartRequest(BaseModel):
 
 
 class RecorderStartRequest(BaseModel):
-    source: str = Field(default="wind", pattern="^(wind|dde)$")
+    source: str = Field(default="dde", pattern="^dde$")
     zmq_port: int = 5555
 
 
@@ -465,7 +463,7 @@ def _get_running_recorder_source() -> Optional[str]:
     if not recs:
         return None
     cmd = safe_cmdline(recs[0])
-    return arg_from_cmd(cmd, "--source", "wind").lower() or "wind"
+    return arg_from_cmd(cmd, "--source", "dde").lower() or "dde"
 
 
 def _ensure_infinitrader_running() -> None:
@@ -677,7 +675,7 @@ def reopen_process(pid: int) -> Dict[str, Any]:
     cmd = safe_cmdline(proc)
     if _is_real_databus_proc(proc):
         module = "data_bus.bus"
-        args = ["--source", arg_from_cmd(cmd, "--source", "wind")]
+        args = ["--source", arg_from_cmd(cmd, "--source", "dde")]
         if "--no-persist" in cmd:
             args.append("--no-persist")
     elif _is_real_monitor_proc(proc):
@@ -725,19 +723,6 @@ def kill_all() -> Dict[str, Any]:
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             pass
     return {"ok": True, "killed": killed}
-
-
-@app.post("/api/actions/fetch-optionchain")
-def start_fetch_optionchain() -> Dict[str, Any]:
-    today_str = bj_today().strftime("%Y-%m-%d")
-    if not launch_fetch_task(today_str):
-        raise HTTPException(status_code=409, detail="期权链抓取正在进行中")
-    return {"ok": True, "date": today_str}
-
-
-@app.get("/api/actions/fetch-status")
-def fetch_status() -> Dict[str, Any]:
-    return get_fetch_state()
 
 
 @app.post("/api/actions/merge")

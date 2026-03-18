@@ -4,7 +4,7 @@ ETF 期权 PCP 套利工具，采用四层流水线结构：
 
 ```
 【第 1 层】数据采集层
-  数据源（Wind API / DDE）
+  数据源（DDE）
        ↓
 【第 2 层】数据总线层
   data_bus/bus.py          — ZMQ PUB（tcp://127.0.0.1:5555）+ 可选 Parquet 落盘
@@ -20,7 +20,7 @@ ETF 期权 PCP 套利工具，采用四层流水线结构：
 
 | 层 | 模块 | 说明 |
 |----|------|------|
-| 数据采集 | `data_bus/bus.py` | 消费 `WindSubscriber` 或 `DDEDirectSubscriber` 的 tick，写 Parquet 分片，同时 ZMQ PUB 广播 |
+| 数据采集 | `data_bus/bus.py` | 消费 `DDEDirectSubscriber` 的 tick，写 Parquet 分片，同时 ZMQ PUB 广播 |
 | 数据总线 | ZMQ PUB 5555 | 统一消息格式：`OPT_` / `ETF_` 前缀；每 30 秒刷盘，15:10 自动日终合并 |
 | 消费层 | `monitors/monitor.py` | ZMQ SUB → `PCPArbitrage.scan_pairs_for_display()` → Rich 终端表格 |
 | 消费层 | `web/market_cache.py` | ZMQ SUB（CONFLATE=1）→ LKV → 每 100ms Brent 法 IV → asyncio Queue → WS 推送 |
@@ -38,7 +38,7 @@ python console.py
 
 1. 打开 无限易
 2. 在无限易中对所需合约选择导出DDE（真实开门机制，若已初始化无需再打开Excel）。
-3. 启动 DataBus（Wind 或 DDE）。
+3. **9:25 前**启动 DataBus（DDE 连接热身需 1-5 秒，提前启动确保 9:30:00 开盘 tick 被落盘）。
 4. 启动 Monitor。
 5. 收盘后执行"合并今日分片"并关闭进程。
 
@@ -62,16 +62,12 @@ python console.py
 ## 关键命令
 
 ```bash
-# 抓取合约链
-python -m data_engine.optionchain_fetcher
-
 # 抓取 Shibor + 中债国债收益率曲线
 python -m data_engine.bond_termstructure_fetcher --kind all
 python -m data_engine.bond_termstructure_fetcher --kind shibor --date 2026-03-05
 python -m data_engine.bond_termstructure_fetcher --kind cgb
 
 # 启动 DataBus
-python -m data_bus.bus --source wind
 python -m data_bus.bus --source dde
 python -m data_bus.bus --source dde --no-persist   # 仅广播不落盘
 
@@ -82,7 +78,6 @@ python -m monitors.monitor --zmq-port 5555
 
 ## 模块命名（当前标准）
 
-- `data_engine.optionchain_fetcher`
 - `data_engine.bond_termstructure_fetcher`：从 Shibor 官网与中债官网爬取当日期限结构，横表落盘
 - `data_engine.contract_catalog`
 - `data_engine.tick_data_loader`
@@ -289,6 +284,9 @@ xlsx 是 ZIP，`_load_topic_map()` 解析其中的 `xl/externalLinks/externalLin
 
 ## 最近变更
 
+- **移除 Wind 数据源**：删除 `WindSubscriber`、`WindAdapter`、`wind_helpers`、`optionchain_fetcher`；DataBus 仅保留 DDE 模式，`--source` 参数只接受 `dde`；控制台移除"抓取期权链"入口
+- **DataBus 开盘 tick 保全**：`bus.py` 主循环改为每条 tick 独立取实时墙钟判断交易时段，消除批量处理 1000 条时 9:30:00 边界处的竞态窗口；**建议每日 9:25 前启动 DataBus**
+- **Web Monitor 二级折叠**：表格新增"到期日+合约类型"层级折叠（默认展开），方向列改为左对齐
 - **Web Monitor 显示优化**：净利润/Net_1T 改为整数显示（与终端一致）；新增方向列（正向/空，三档配色）；IV 标签移至表头正向/≥N元之后，配对/有报价保留右对齐；品种名加粗；各品种默认折叠；行高固定 26px 防抖动
 - **交易日计算后移后端**：`utils/time_utils` 新增 `trading_days_until()`（akshare 日历，回退工作日），`market_cache` 序列化时附加 `expiry_info`（自然日/交易日），前端不再自行计算；终端 monitor 私有函数提升为共用工具
 - **DDE 状态机重构**：`_DDEClient` 由逐字段攒 buf 触发改为永久状态机 + `_flush_dirty` 泵送后统一发送，支持无成交远月合约（只需有盘口），消除微观状态撕裂；BLANK/ERROR 回调写入哨兵值（askv1=0/ask1=999999 等）而非 NaN

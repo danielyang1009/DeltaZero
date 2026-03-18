@@ -60,20 +60,6 @@ pre{background:#0f172a;color:#e2e8f0;padding:10px;border-radius:8px;max-height:1
     <div id="metadataFiles" style="margin-top:8px;font-size:12px;color:#64748b"></div>
   </div>
   <div class="card">
-    <div class="card-title">Wind</div>
-    <div style="display:flex;gap:8px;flex-wrap:wrap">
-      <button class="btn-secondary" id="btnFetch" onclick="runFetch()">抓取今日期权链</button>
-    </div>
-    <div id="fetchProgress" style="display:none">
-      <div class="progress-wrap">
-        <div class="progress-bar" id="fetchBar" style="width:0%"></div>
-        <div class="progress-text" id="fetchPct">0%</div>
-      </div>
-      <div class="kv" id="fetchStep" style="color:#64748b"></div>
-    </div>
-    <pre id="fetchLog" style="display:none"></pre>
-  </div>
-  <div class="card">
     <div class="card-title">Yieldcurve</div>
     <div style="display:flex;gap:8px;flex-wrap:wrap">
       <button class="btn-primary" id="btnFetchCgb" onclick="runFetchBond('cgb')">抓取 CGB</button>
@@ -131,7 +117,6 @@ pre{background:#0f172a;color:#e2e8f0;padding:10px;border-radius:8px;max-height:1
 <script>
 const POLL_MS = 3000;
 let pollTimer = null;
-let fetchPollTimer = null;
 let marketDataDir = "";
 
 function $(id){ return document.getElementById(id); }
@@ -283,7 +268,6 @@ function renderRecorder(st){
     el.innerHTML = html;
     act.innerHTML = `
       <button class="btn-primary btn-sm" onclick="startRecorder('dde')">启动 DDE DataBus</button>
-      <button class="btn-open btn-sm" onclick="startRecorder('wind')">启动 Wind DataBus</button>
     `;
   }
 }
@@ -361,7 +345,7 @@ async function killAll(){
   await refresh();
 }
 
-async function startRecorder(source="wind"){
+async function startRecorder(source="dde"){
   try{
     const r = await api("/api/processes/recorder/start","POST", { source, zmq_port: parseInt($("monZmq").value) || 5555 });
     toast(`${source.toUpperCase()} DataBus 已启动 PID `+r.started.pid);
@@ -385,54 +369,6 @@ n_each_side: parseInt($("monNEachSide").value) || 0,
     toast("Monitor 已启动 PID "+r.started.pid);
   } catch(e){ toast(e.message, false); }
   setTimeout(refresh, 1500);
-}
-
-async function runFetch(){
-  $("btnFetch").disabled = true;
-  $("fetchProgress").style.display = "block";
-  $("fetchLog").style.display = "none";
-  $("fetchBar").style.width = "5%";
-  $("fetchPct").innerText = "连接 Wind...";
-  $("fetchStep").innerText = "";
-
-  try{ await api("/api/actions/fetch-optionchain","POST"); }
-  catch(e){ toast(e.message, false); $("btnFetch").disabled = false; return; }
-
-  if(fetchPollTimer) clearInterval(fetchPollTimer);
-  fetchPollTimer = setInterval(pollFetchStatus, 600);
-}
-
-async function pollFetchStatus(){
-  try{
-    const st = await api("/api/actions/fetch-status");
-    const total = st.total || 3;
-    const step = st.step || 0;
-    const pct = st.done ? 100 : Math.min(Math.round((step / total) * 100), 95);
-    $("fetchBar").style.width = pct + "%";
-    if(st.done){
-      $("fetchPct").innerText = "100%";
-      $("fetchBar").style.width = "100%";
-      $("fetchBar").style.background = st.ok ? "#16a34a" : "#dc2626";
-    } else {
-      $("fetchPct").innerText = `${step}/${total}`;
-    }
-    if(st.current && st.current !== "done"){
-      $("fetchStep").innerText = `正在抓取 ${st.current} ...`;
-    } else if(st.done){
-      $("fetchStep").innerText = st.ok ? "抓取完成" : "抓取失败";
-    }
-    if(st.done){
-      clearInterval(fetchPollTimer);
-      fetchPollTimer = null;
-      $("btnFetch").disabled = false;
-      if(st.output){
-        $("fetchLog").style.display = "block";
-        $("fetchLog").innerText = st.output;
-      }
-      toast(st.ok ? "期权链抓取完成" : "期权链抓取失败", st.ok);
-      await refresh();
-    }
-  } catch(e){ console.error(e); }
 }
 
 async function runMerge(){

@@ -1,88 +1,11 @@
 from __future__ import annotations
 
-import subprocess
-import sys
-import threading
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Dict, Optional
 
 from config.settings import ETF_CODE_TO_NAME
 from utils.time_utils import bj_from_timestamp, bj_now_naive, bj_today
-
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-
-_fetch_lock = threading.Lock()
-_fetch_state: Dict[str, Any] = {
-    "running": False,
-    "step": 0,
-    "total": 3,
-    "current": "",
-    "done": False,
-    "ok": False,
-    "output": "",
-}
-
-
-def reset_fetch_state() -> None:
-    _fetch_state.update(running=False, step=0, total=3, current="", done=False, ok=False, output="")
-
-
-def get_fetch_state() -> Dict[str, Any]:
-    return dict(_fetch_state)
-
-
-def launch_fetch_task(date_str: str, timeout: int = 90, retry: int = 1) -> bool:
-    with _fetch_lock:
-        if _fetch_state["running"]:
-            return False
-        reset_fetch_state()
-        _fetch_state["running"] = True
-    t = threading.Thread(target=run_fetch_bg, args=(date_str, timeout, retry), daemon=True)
-    t.start()
-    return True
-
-
-def run_fetch_bg(date_str: str, timeout: int = 90, retry: int = 1) -> None:
-    cmd = [
-        sys.executable,
-        "-m",
-        "data_engine.optionchain_fetcher",
-        "--date",
-        date_str,
-        "--timeout",
-        str(timeout),
-        "--retry",
-        str(retry),
-    ]
-    try:
-        proc = subprocess.Popen(
-            cmd,
-            cwd=str(PROJECT_ROOT),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-        )
-        lines = []
-        assert proc.stdout is not None
-        for line in proc.stdout:
-            line = line.rstrip("\n")
-            lines.append(line)
-            if line.startswith("PROGRESS:"):
-                parts = line.split(":")
-                if len(parts) >= 4:
-                    _fetch_state["step"] = int(parts[1])
-                    _fetch_state["total"] = int(parts[2])
-                    _fetch_state["current"] = parts[3]
-        proc.wait()
-        _fetch_state["ok"] = proc.returncode == 0
-        _fetch_state["output"] = "\n".join(lines[-30:])
-    except Exception as exc:
-        _fetch_state["ok"] = False
-        _fetch_state["output"] = str(exc)
-    finally:
-        _fetch_state["done"] = True
-        _fetch_state["running"] = False
 
 
 def read_snapshot_stats(market_data_dir: str) -> Optional[Dict]:

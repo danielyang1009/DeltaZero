@@ -3,7 +3,7 @@
 数据记录主进程
 
 职责：
-  1. 启动 Wind 订阅（Push 回调模式）
+  1. 启动 DDE 订阅
   2. 从 tick 队列消费数据：写 Parquet 缓冲区 + ZMQ 广播
   3. 每 flush_interval_secs 秒将缓冲区刷入磁盘（分片 Parquet）
   4. 更新 snapshot_latest.parquet（供策略进程冷启动恢复）
@@ -36,7 +36,6 @@ fix_windows_encoding()
 
 from config.settings import get_recorder_config, RecorderConfig
 from data_bus.parquet_writer import ParquetWriter
-from data_bus.wind_subscriber import WindSubscriber
 from data_bus.dde_direct_client import DDEDirectSubscriber
 from data_bus.zmq_publisher import ZMQPublisher
 from models import TickPacket
@@ -64,7 +63,7 @@ def _in_trading_hours(now: datetime) -> bool:
 # 主循环
 # ──────────────────────────────────────────────────────────────────────
 
-def run(config: RecorderConfig, source: str = "wind", persist: bool = True) -> None:
+def run(config: RecorderConfig, source: str = "dde", persist: bool = True) -> None:
     """数据记录主循环"""
 
     logger.info("=" * 60)
@@ -84,18 +83,10 @@ def run(config: RecorderConfig, source: str = "wind", persist: bool = True) -> N
         ParquetWriter(config.output_dir, config.flush_interval_secs) if persist else None
     )
     publisher = ZMQPublisher(config.zmq_port)
-    if source == "dde":
-        subscriber = DDEDirectSubscriber(
-            products=config.products,
-            tick_queue=tick_queue,
-        )
-    else:
-        subscriber = WindSubscriber(
-            products        = config.products,
-            tick_queue      = tick_queue,
-            batch_size      = config.batch_size,
-            max_expiry_days = config.max_expiry_days,
-        )
+    subscriber = DDEDirectSubscriber(
+        products=config.products,
+        tick_queue=tick_queue,
+    )
 
     # ── 2. 启动数据订阅 ──────────────────────────────────────────────
     logger.info("正在启动 %s 数据订阅...", source.upper())
@@ -104,21 +95,14 @@ def run(config: RecorderConfig, source: str = "wind", persist: bool = True) -> N
         publisher.close()
         return
 
-    if source == "dde":
-        etf_count = getattr(subscriber, "etf_count", 0)
-        active_underlyings = getattr(subscriber, "active_underlyings", [])
-        logger.info(
-            "订阅完成：%d 个期权合约 + %d 个 ETF（实际标的: %s）",
-            subscriber.option_count,
-            etf_count,
-            active_underlyings or "N/A",
-        )
-    else:
-        logger.info(
-            "订阅完成：%d 个期权合约 + %d 个 ETF",
-            subscriber.option_count,
-            len(config.products),
-        )
+    etf_count = getattr(subscriber, "etf_count", 0)
+    active_underlyings = getattr(subscriber, "active_underlyings", [])
+    logger.info(
+        "订阅完成：%d 个期权合约 + %d 个 ETF（实际标的: %s）",
+        subscriber.option_count,
+        etf_count,
+        active_underlyings or "N/A",
+    )
     logger.info("开始接收行情，按 Ctrl+C 退出...")
 
     # ── 3. 主循环 ──────────────────────────────────────────────────────
@@ -142,7 +126,7 @@ def run(config: RecorderConfig, source: str = "wind", persist: bool = True) -> N
                 except Empty:
                     break
 
-                in_hours = _in_trading_hours(now)
+                in_hours = _in_trading_hours(bj_now_naive())
                 if pkt.is_etf:
                     if writer is not None and (source != "dde" or in_hours):
                         writer.on_etf_tick(pkt.tick_row)
@@ -278,7 +262,7 @@ def _maybe_heartbeat(total: int, queue_size: int, writer: Optional[ParquetWriter
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="实时数据记录进程（支持 wind / dde）",
+        description="实时数据记录进程（DDE 数据源）",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例:
@@ -296,8 +280,8 @@ def _parse_args() -> argparse.Namespace:
                         help="分片刷新间隔秒数（默认: 30）")
     parser.add_argument("--batch", type=int, default=None,
                         help="wsq 每批代码数（默认: 80）")
-    parser.add_argument("--source", choices=["wind", "dde"], default="wind",
-                        help="数据源类型（默认: wind）")
+    parser.add_argument("--source", choices=["dde"], default="dde",
+                        help="数据源类型（默认: dde）")
     parser.add_argument("--no-persist", action="store_true",
                         help="仅做总线广播，不写 Parquet 磁盘文件")
     parser.add_argument("--new-window", action="store_true",

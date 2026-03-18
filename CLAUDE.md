@@ -12,7 +12,6 @@ python console.py
 python console.py --start-dde-pipeline
 
 # 数据总线
-python -m data_bus.bus --source wind
 python -m data_bus.bus --source dde
 python -m data_bus.bus --source dde --no-persist   # 仅广播不落盘
 
@@ -21,7 +20,6 @@ python -m monitors.monitor
 python -m monitors.monitor --min-profit 100 --expiry-days 30 --n-each-side 10
 
 # 数据抓取
-python -m data_engine.optionchain_fetcher
 python -m data_engine.bond_termstructure_fetcher --kind all
 python -m data_engine.bond_termstructure_fetcher --kind cgb
 
@@ -33,7 +31,7 @@ python -m backtest.run
 
 ```
 【第 1 层】数据采集层
-  数据源（Wind API / DDE）
+  数据源（DDE）
        ↓
 【第 2 层】数据总线层
   data_bus/bus.py          — ZMQ PUB（tcp://127.0.0.1:5555）+ 可选 Parquet 落盘
@@ -46,7 +44,7 @@ python -m backtest.run
   web/dashboard.py         — FastAPI 控制台 + WebSocket /ws/vol_smile 推送
 ```
 
-**DataBus（`data_bus/bus.py`）**：消费来自 `WindSubscriber` 或 `DDESubscriber` 的 tick，写入 Parquet 分片（`D:\MARKET_DATA\chunks\`），同时通过 `ZMQPublisher` 广播 `OPT_` / `ETF_` 前缀消息。每 30 秒刷盘，15:10 自动触发日终合并为 `options_YYYYMMDD.parquet` / `etf_YYYYMMDD.parquet`，并维护 `snapshot_latest.parquet` 供 Monitor 冷启动恢复。
+**DataBus（`data_bus/bus.py`）**：消费来自 `DDEDirectSubscriber` 的 tick，写入 Parquet 分片（`D:\MARKET_DATA\chunks\`），同时通过 `ZMQPublisher` 广播 `OPT_` / `ETF_` 前缀消息。每 30 秒刷盘，15:10 自动触发日终合并为 `options_YYYYMMDD.parquet` / `etf_YYYYMMDD.parquet`，并维护 `snapshot_latest.parquet` 供 Monitor 冷启动恢复。
 
 **Monitor（`monitors/monitor.py`）**：订阅 ZMQ，调用 `PCPArbitrage.scan_pairs_for_display()` 计算信号，用 `rich.Live` 渲染终端表格。共享逻辑（合约加载、快照恢复、消息解析）在 `monitors/common.py`。
 

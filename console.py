@@ -28,7 +28,7 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="DeltaZero 控制台统一入口")
     parser.add_argument(
         "--bus-source",
-        choices=["none", "wind", "dde"],
+        choices=["none", "dde"],
         default="none",
         help="可选：启动 DataBus（none/wind/dde，默认 none）",
     )
