@@ -25,7 +25,7 @@ from typing import Dict, List, Optional
 import numpy as np
 import pandas as pd
 
-from models import TickData, normalize_code
+from models import OptionTickData, normalize_code
 
 logger = logging.getLogger(__name__)
 
@@ -60,7 +60,7 @@ class TickLoader:
         """
         self._code_suffix = code_suffix
 
-    def load_csv(self, filepath: str | Path) -> List[TickData]:
+    def load_csv(self, filepath: str | Path) -> List[OptionTickData]:
         """
         加载单个 CSV 文件并转换为 TickData 列表（向量化实现）
 
@@ -130,9 +130,9 @@ class TickLoader:
 
         # === 构建 TickData 列表（通过数组索引，避免 iterrows 开销）===
         n = len(df)
-        ticks: List[TickData] = []
+        ticks: List[OptionTickData] = []
         for i in range(n):
-            ticks.append(TickData(
+            ticks.append(OptionTickData(
                 timestamp=timestamps[i],
                 contract_code=codes[i],
                 current=float(current_arr[i]),
@@ -156,7 +156,7 @@ class TickLoader:
         dirpath: str | Path,
         start_month: Optional[str] = None,
         end_month: Optional[str] = None,
-    ) -> Dict[str, List[TickData]]:
+    ) -> Dict[str, List[OptionTickData]]:
         """
         递归加载目录下所有 CSV 文件，支持按月份范围过滤
 
@@ -184,7 +184,7 @@ class TickLoader:
             start_month or "最早", end_month or "最新",
         )
 
-        result: Dict[str, List[TickData]] = {}
+        result: Dict[str, List[OptionTickData]] = {}
 
         for idx, csv_file in enumerate(csv_files, 1):
             logger.info("[%d/%d] 加载: %s", idx, len(csv_files), csv_file.name)

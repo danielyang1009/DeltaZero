@@ -22,7 +22,7 @@ from pathlib import Path
 from queue import Queue
 from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
-from models import DataProvider, ETFTickData, TickData, TickPacket, normalize_code
+from models import DataProvider, ETFTickData, OptionTickData, TickPacket, normalize_code
 
 logger = logging.getLogger(__name__)
 
@@ -858,7 +858,7 @@ class DDEDirectSubscriber(DataProvider):
             "is_adjusted": is_adjusted,
             "multiplier":  multiplier,
         }
-        tick_obj = TickData(
+        tick_obj = OptionTickData(
             timestamp=ts,
             contract_code=code,
             current=last,

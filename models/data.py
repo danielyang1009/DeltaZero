@@ -84,7 +84,7 @@ def normalize_code(code: str, target_suffix: str = ".SH") -> str:
 # ============================================================
 
 @dataclass
-class TickData:
+class OptionTickData:
     """
     统一的期权 Tick 行情数据结构
 
@@ -230,10 +230,10 @@ class MarketSnapshot:
       - 回测：backtest/engine.py 中的 TickAligner 在每个 MergedTick 后更新快照
     """
     ts: datetime
-    options: Dict[str, TickData]     # contract_code → latest TickData
+    options: Dict[str, OptionTickData]     # contract_code → latest TickData
     etf: Dict[str, ETFTickData]      # etf_code → latest ETFTickData
 
-    def get_option(self, code: str) -> Optional[TickData]:
+    def get_option(self, code: str) -> Optional[OptionTickData]:
         return self.options.get(code)
 
     def get_etf(self, underlying: str) -> Optional[ETFTickData]:

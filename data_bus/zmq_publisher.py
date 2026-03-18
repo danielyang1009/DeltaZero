@@ -25,7 +25,7 @@ import logging
 import math
 from typing import Optional
 
-from models import ETFTickData, TickData
+from models import ETFTickData, OptionTickData
 
 logger = logging.getLogger(__name__)
 
@@ -55,7 +55,7 @@ class ZMQPublisher:
     # 公开接口
     # ──────────────────────────────────────────────────────────
 
-    def publish_option(self, tick: TickData, underlying_code: str) -> None:
+    def publish_option(self, tick: OptionTickData, underlying_code: str) -> None:
         """广播期权 tick"""
         if not self._enabled:
             return

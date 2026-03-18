@@ -23,7 +23,7 @@ from models import (
     ContractInfo,
     ETFTickData,
     OptionType,
-    TickData,
+    OptionTickData,
 )
 
 logger = logging.getLogger(__name__)
@@ -77,7 +77,7 @@ class ETFSimulator:
 
     def simulate_from_option_ticks(
         self,
-        option_ticks: Dict[str, List[TickData]],
+        option_ticks: Dict[str, List[OptionTickData]],
         contracts: Dict[str, ContractInfo],
         etf_code: str,
         initial_price: float,
@@ -179,7 +179,7 @@ class ETFSimulator:
 
     def _compute_anchor_points(
         self,
-        option_ticks: Dict[str, List[TickData]],
+        option_ticks: Dict[str, List[OptionTickData]],
         contracts: Dict[str, ContractInfo],
         all_timestamps: List[datetime],
     ) -> Dict[datetime, float]:
@@ -208,7 +208,7 @@ class ETFSimulator:
             return {}
 
         anchors: Dict[datetime, List[float]] = defaultdict(list)
-        latest_quotes: Dict[str, TickData] = {}
+        latest_quotes: Dict[str, OptionTickData] = {}
 
         tick_index: Dict[str, int] = {code: 0 for code in option_ticks}
 
@@ -298,7 +298,7 @@ class ETFSimulator:
 
     @staticmethod
     def _collect_all_timestamps(
-        option_ticks: Dict[str, List[TickData]],
+        option_ticks: Dict[str, List[OptionTickData]],
     ) -> List[datetime]:
         """收集并去重排序所有期权 Tick 的时间戳"""
         ts_set: set = set()

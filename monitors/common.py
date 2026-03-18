@@ -32,7 +32,7 @@ from models import (
     ETFTickData,
     OptionType,
     SignalType,
-    TickData,
+    OptionTickData,
     normalize_code,
 )
 from config.settings import ETF_CODE_TO_NAME, UNDERLYINGS, TradingConfig, get_default_config
@@ -225,7 +225,7 @@ def restore_from_snapshot(
                     continue
                 askv1 = _safe_int(row.get("askv1"))
                 bidv1 = _safe_int(row.get("bidv1"))
-                tick = TickData(
+                tick = OptionTickData(
                     timestamp=tick_ts,
                     contract_code=code,
                     current=last,
@@ -252,7 +252,7 @@ def restore_from_snapshot(
 
 def parse_zmq_message(
     raw: str,
-) -> Optional[Union[ETFTickData, TickData]]:
+) -> Optional[Union[ETFTickData, OptionTickData]]:
     """
     解析一条 ZMQ 广播消息，返回 ETFTickData 或 TickData，解析失败返回 None。
     """
@@ -290,7 +290,7 @@ def parse_zmq_message(
                 ask1 = float(last)
             if math.isnan(bid1):
                 bid1 = float(last)
-            return TickData(
+            return OptionTickData(
                 timestamp=ts,
                 contract_code=normalize_code(d["code"], ".SH"),
                 current=float(last),

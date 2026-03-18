@@ -20,7 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
-from models.data import ContractInfo, ETFTickData, OptionType, TickData
+from models.data import ContractInfo, ETFTickData, OptionType, OptionTickData
 from data_engine.tick_aligner import TickAligner
 from strategies.pcp_arbitrage import PCPArbitrageStrategy
 from config.settings import TradingConfig
@@ -56,7 +56,7 @@ put_info  = _make_contract(PUT_CODE,  OptionType.PUT)
 # ── Mock Tick 行情 ───────────────────────────────────────
 now = datetime.now()
 
-call_tick = TickData(
+call_tick = OptionTickData(
     timestamp=now, contract_code=CALL_CODE,
     current=0.102, volume=1000, high=0.110, low=0.095, money=102.0, position=5000,
     bid_prices=[0.100, math.nan, math.nan, math.nan, math.nan],  # 买一=0.100（卖出 Call）
@@ -64,7 +64,7 @@ call_tick = TickData(
     bid_volumes=[200, 0, 0, 0, 0],
     ask_volumes=[150, 0, 0, 0, 0],
 )
-put_tick = TickData(
+put_tick = OptionTickData(
     timestamp=now, contract_code=PUT_CODE,
     current=0.058, volume=800, high=0.065, low=0.050, money=46.4, position=3000,
     bid_prices=[0.055, math.nan, math.nan, math.nan, math.nan],

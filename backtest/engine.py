@@ -22,7 +22,7 @@ from datetime import datetime
 from typing import Callable, Dict, List, Optional, Tuple
 
 from config.settings import TradingConfig
-from models import ContractInfo, ETFTickData, TickData, TradeSignal
+from models import ContractInfo, ETFTickData, OptionTickData, TradeSignal
 from risk.margin import MarginCalculator
 
 from backtest.data_feed import HistoricalFeed, MergedTick   # noqa: F401  (re-export MergedTick)
@@ -63,7 +63,7 @@ class BacktestEngine:
 
     def run(
         self,
-        option_ticks: Dict[str, List[TickData]],
+        option_ticks: Dict[str, List[OptionTickData]],
         etf_ticks: List[ETFTickData],
         contracts: Dict[str, ContractInfo],
         strategy_callback: Callable[

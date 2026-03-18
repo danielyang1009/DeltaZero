@@ -29,7 +29,7 @@ from models import (
     ContractInfo,
     ETFTickData,
     SignalType,
-    TickData,
+    OptionTickData,
     TradeSignal,
 )
 from models.data import MarketSnapshot
@@ -53,11 +53,11 @@ class TickAligner:
     """
 
     def __init__(self) -> None:
-        self.latest_option_quotes: Dict[str, TickData] = {}
+        self.latest_option_quotes: Dict[str, OptionTickData] = {}
         self.latest_etf_quotes: Dict[str, ETFTickData] = {}   # 按标的代码分别存储
         self.latest_etf_quote: Optional[ETFTickData] = None   # 向后兼容：最近更新的 ETF
 
-    def update_option(self, tick: TickData) -> None:
+    def update_option(self, tick: OptionTickData) -> None:
         """更新期权报价快照"""
         self.latest_option_quotes[tick.contract_code] = tick
 
@@ -66,7 +66,7 @@ class TickAligner:
         self.latest_etf_quotes[tick.etf_code] = tick
         self.latest_etf_quote = tick  # 向后兼容
 
-    def get_option_quote(self, code: str) -> Optional[TickData]:
+    def get_option_quote(self, code: str) -> Optional[OptionTickData]:
         """获取指定合约的最新报价"""
         return self.latest_option_quotes.get(code)
 
@@ -290,7 +290,7 @@ class PCPArbitrage:
             "tolerance": tolerance,
         }
 
-    def on_option_tick(self, tick: TickData) -> None:
+    def on_option_tick(self, tick: OptionTickData) -> None:
         """接收期权 Tick 更新"""
         self.aligner.update_option(tick)
 
@@ -612,8 +612,8 @@ class PCPArbitrage:
     @staticmethod
     def _calc_confidence(
         profit: float,
-        call_tick: TickData,
-        put_tick: TickData,
+        call_tick: OptionTickData,
+        put_tick: OptionTickData,
     ) -> float:
         """综合置信度：利润大小 + 盘口价差 + 挂单量"""
         profit_score = min(profit / 500.0, 1.0)

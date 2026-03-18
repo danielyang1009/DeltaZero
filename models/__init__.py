@@ -16,7 +16,7 @@ from models.data import (
     UNDERLYING_MAP,
     CODE_SUFFIX_MAP,
     normalize_code,
-    TickData,
+    OptionTickData,
     ETFTickData,
     TickPacket,
     DataProvider,
@@ -42,7 +42,7 @@ from models.order import (
 __all__ = [
     # data
     "OptionType", "UNDERLYING_MAP", "CODE_SUFFIX_MAP", "normalize_code",
-    "TickData", "ETFTickData", "TickPacket", "DataProvider",
+    "OptionTickData", "ETFTickData", "TickPacket", "DataProvider",
     "ContractInfo", "MarketSnapshot", "GreeksAttribution",
     # order
     "SignalType", "OrderSide", "AssetType",

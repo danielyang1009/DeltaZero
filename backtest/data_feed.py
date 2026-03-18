@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Dict, Iterator, List, Optional
 
-from models import ETFTickData, TickData
+from models import ETFTickData, OptionTickData
 
 
 @dataclass
@@ -27,7 +27,7 @@ class MergedTick:
     """合并后的 Tick 事件，统一期权和 ETF Tick"""
     timestamp: datetime
     tick_type: str                      # "option" | "etf"
-    option_tick: Optional[TickData]  = None
+    option_tick: Optional[OptionTickData]  = None
     etf_tick: Optional[ETFTickData]  = None
 
 
@@ -45,7 +45,7 @@ class HistoricalFeed:
 
     def __init__(
         self,
-        option_ticks: Dict[str, List[TickData]],
+        option_ticks: Dict[str, List[OptionTickData]],
         etf_ticks: List[ETFTickData],
     ) -> None:
         self._merged: List[MergedTick] = self._merge(option_ticks, etf_ticks)
@@ -66,7 +66,7 @@ class HistoricalFeed:
 
     def _merge(
         self,
-        option_ticks: Dict[str, List[TickData]],
+        option_ticks: Dict[str, List[OptionTickData]],
         etf_ticks: List[ETFTickData],
     ) -> List[MergedTick]:
         """合并所有 Tick 流并按时间排序"""

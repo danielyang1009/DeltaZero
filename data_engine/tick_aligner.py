@@ -29,7 +29,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Dict, Optional, Union
 
-from models.data import ETFTickData, MarketSnapshot, TickData
+from models.data import ETFTickData, MarketSnapshot, OptionTickData
 
 
 class TickAligner:
@@ -45,14 +45,14 @@ class TickAligner:
     """
 
     def __init__(self) -> None:
-        self._options_lkv: Dict[str, TickData]    = {}
+        self._options_lkv: Dict[str, OptionTickData]    = {}
         self._etf_lkv: Dict[str, ETFTickData]     = {}
 
     # ──────────────────────────────────────────────────────────
     # 核心接口
     # ──────────────────────────────────────────────────────────
 
-    def update_tick(self, tick: Union[TickData, ETFTickData]) -> MarketSnapshot:
+    def update_tick(self, tick: Union[OptionTickData, ETFTickData]) -> MarketSnapshot:
         """
         接收一个新 tick，更新内部 LKV，返回当前完整市场截面快照。
 
@@ -85,7 +85,7 @@ class TickAligner:
     # 辅助接口
     # ──────────────────────────────────────────────────────────
 
-    def update_option(self, tick: TickData) -> None:
+    def update_option(self, tick: OptionTickData) -> None:
         """单独更新期权 LKV（不返回快照，适合批量导入场景）"""
         self._options_lkv[tick.contract_code] = tick
 
@@ -93,7 +93,7 @@ class TickAligner:
         """单独更新 ETF LKV（不返回快照，适合批量导入场景）"""
         self._etf_lkv[tick.etf_code] = tick
 
-    def get_option_quote(self, code: str) -> Optional[TickData]:
+    def get_option_quote(self, code: str) -> Optional[OptionTickData]:
         """获取指定期权合约的最新报价（供 VIX 引擎使用）。"""
         return self._options_lkv.get(code)
 
