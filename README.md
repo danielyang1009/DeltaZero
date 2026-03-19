@@ -25,6 +25,55 @@ ETF 期权 PCP 套利工具，采用四层流水线结构：
 | 消费层 | `monitors/monitor.py` | ZMQ SUB → `TickAligner` + `PCPArbitrageStrategy.scan_pairs_for_display()` → Rich 终端表格 |
 | 消费层 | `web/market_cache.py` | ZMQ SUB（CONFLATE=1）→ LKV → 每 100ms Brent 法 IV → asyncio Queue → WS 推送 |
 
+## 策略架构：Alpha / Execution 分层
+
+### 核心原则
+
+1. **策略绝对无状态化**：`strategies/` 下的所有策略类必须是纯函数式"数学大脑"，**绝对禁止**在策略内部维护字典、队列或存储历史 Tick 状态。
+2. **读写解耦**：策略只负责发现机会并输出 `ArbitrageSignal`，绝对不感知真实资金、持仓或撮合逻辑。Signal → Order 的转化是执行层专属职责。
+3. **单一数据真相**：实盘和回测必须且只能通过 `MarketSnapshot`（由 `TickAligner` 生成）这一唯一载体与策略交互。
+
+### 架构全景图
+
+```
+       【管线 A：实时实盘流】                      【管线 B：历史回测流】
+    (Live Market Data: DDE/ZMQ)             (Historical Data: Parquet)
+                 │                                        │
+                 ▼                                        ▼
+      [ monitors/monitor.py ]               [ backtest/data_feed.py ]
+      (ZMQ Subscriber)                      (HistoricalFeed/TickLoader)
+                 │                                        │
+                 └───────────────┬────────────────────────┘
+                                 │ (OptionTickData / ETFTickData)
+                                 ▼
+              =========================================
+              ||     [ data_engine/tick_aligner.py ] || 状态机 (Stateful)
+              ||             TickAligner             || 拼装最新已知值 (LKV)
+              =========================================
+                                 │
+                                 ▼ (MarketSnapshot)  <-- 统一接口，隔绝实盘与回测的差异
+              =========================================
+              ||         [ strategies/base.py ]      ||
+              ||         PCPArbitrageStrategy        || 纯数学大脑 (Stateless)
+              =========================================
+                                 │
+                                 ▼ (ArbitrageSignal) <-- 纯粹的机会观察，无执行意图
+              ┌──────────────────┴──────────────────┐
+              │                                     │
+              ▼                                     ▼
+【管线 A 终点：视觉展示】                  【管线 B 终点：执行与账务】
+[ monitors/monitor.py ]                [ backtest/engine.py & broker.py ]
+[ web/market_cache.py ]                - 哨兵拦截 (999999.0 拒单)
+- Rich UI 终端渲染                     - 买卖价差撮合 (跨价撮合)
+- WebSocket 推送                       - 容量限制裁剪 (Volume Constraint)
+(等待人类手动下单)                                   │
+                                                    ▼ (TradeRecord)
+                                       [ backtest/portfolio.py ]
+                                       - 资金预检 (Cash Check)
+                                       - 调用 risk/margin.py 算保证金
+                                       - 记录盈亏与资金曲线
+```
+
 ## 快速启动
 
 ```bash
