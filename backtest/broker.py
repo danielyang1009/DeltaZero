@@ -25,6 +25,7 @@ from models import (
     AssetType,
     ContractInfo,
     OrderSide,
+    SignalAction,
     TradeRecord,
 )
 from risk.margin import MarginCalculator
@@ -79,7 +80,7 @@ class BacktestBroker(BaseBroker):
         Returns:
             三腿 TradeRecord 列表；任一校验失败返回空列表
         """
-        if getattr(signal, 'action', 'OPEN') == 'CLOSE':
+        if signal.action == SignalAction.CLOSE:
             return self._execute_close(signal, num_sets, signal_id)
 
         slp = self.config.slippage
@@ -246,6 +247,21 @@ class BacktestBroker(BaseBroker):
         if call_exec <= 0 or call_exec >= _SENTINEL_ASK:
             logger.warning("CLOSE 废单：Call 卖一价=%.4f 无效（K=%.4f）", call_exec, signal.strike)
             return []
+
+        # ── 容量限制（平仓盘口承接能力）────────────────────────────
+        if signal.max_qty is not None and num_sets > signal.max_qty:
+            capped = int(signal.max_qty)
+            if capped <= 0:
+                logger.warning(
+                    "CLOSE 废单：盘口容量为零，废单（K=%.4f %s）",
+                    signal.strike, signal.expiry,
+                )
+                return []
+            logger.debug(
+                "CLOSE 容量限制：num_sets %d → %d（max_qty=%.1f）",
+                num_sets, capped, signal.max_qty,
+            )
+            num_sets = capped
 
         # ── 滑点（平仓方向反转：卖出向下，买入向上）────────────────
         etf_exec  -= slp.etf_slippage_ticks    * slp.etf_tick_size

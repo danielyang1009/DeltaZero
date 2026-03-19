@@ -17,9 +17,11 @@ import numpy as np
 
 from models import (
     AccountState,
+    ArbitrageSignal,
+    BaseSignal,
+    DirectionalSignal,
     GreeksAttribution,
     TradeRecord,
-    TradeSignal,
     AssetType,
     OrderSide,
 )
@@ -43,6 +45,17 @@ class PerformanceMetrics:
     total_commission: float         # 总手续费
     avg_profit_per_signal: float    # 每信号平均利润
     trading_days: int               # 交易天数
+
+
+@dataclass
+class SignalPnLResult:
+    """单个信号的标准化结算结果（多态 PnL 统计的 DTO）"""
+    signal_id:     str    # 信号序号（str 形式，兼容未来非整数 ID）
+    signal_type:   str    # 信号类型名，如 "Arbitrage" / "Directional"
+    gross_pnl:     float  # 毛利润（不含手续费和滑点）
+    net_pnl:       float  # 净利润（含手续费和滑点）
+    slippage_cost: float  # 总滑点摩擦
+    commission:    float  # 总手续费
 
 
 class PnLAnalyzer:
@@ -75,7 +88,7 @@ class PnLAnalyzer:
     def analyze(
         self,
         trade_history: List[TradeRecord],
-        signals: List[TradeSignal],
+        signals: List[BaseSignal],
         equity_curve: List[Tuple[datetime, float]],
         initial_capital: float,
     ) -> PerformanceMetrics:
@@ -105,7 +118,8 @@ class PnLAnalyzer:
 
         max_dd, max_dd_pct = self._calc_max_drawdown(equities)
 
-        signal_pnls = self._calc_signal_pnls(signals, trade_history)
+        signal_results = self._dispatch_signal_pnls(signals, trade_history)
+        signal_pnls    = [r.net_pnl for r in signal_results]
         win_rate = self._calc_win_rate(signal_pnls)
         pl_ratio = self._calc_profit_loss_ratio(signal_pnls)
 
@@ -134,7 +148,7 @@ class PnLAnalyzer:
     def calc_greeks_attribution(
         self,
         trade_history: List[TradeRecord],
-        signals: List[TradeSignal],
+        signals: List[BaseSignal],
     ) -> GreeksAttribution:
         """
         希腊字母盈亏归因（骨架实现，结果仅供参考）
@@ -319,16 +333,14 @@ class PnLAnalyzer:
         max_dd_pct = float(drawdown_pcts.max())
         return max_dd, max_dd_pct
 
-    def _calc_signal_pnls(
+    def _dispatch_signal_pnls(
         self,
-        signals: List[TradeSignal],
+        signals: List[BaseSignal],
         trade_history: List[TradeRecord],
-    ) -> List[float]:
+    ) -> List[SignalPnLResult]:
         """
-        计算每个信号的实际盈亏。
-
-        优先使用 trade_history 中的实际成交记录（按 signal_id 匹配），
-        若无匹配的成交记录则回退到预估值。
+        按信号类型分派结算逻辑，返回标准化 DTO 列表。
+        全局统计（胜率/盈亏比）必须基于此结果，禁止在外部直接访问信号字段。
         """
         if not signals:
             return []
@@ -338,19 +350,65 @@ class PnLAnalyzer:
             if t.signal_id is not None:
                 trades_by_signal.setdefault(t.signal_id, []).append(t)
 
-        pnls: List[float] = []
+        results: List[SignalPnLResult] = []
         for i, signal in enumerate(signals):
-            legs = trades_by_signal.get(i)
-            if not legs:
-                pnls.append(signal.net_profit_estimate)
+            legs = trades_by_signal.get(i, [])
+            if isinstance(signal, ArbitrageSignal):
+                res = self._process_arbitrage(signal, i, legs)
+            elif isinstance(signal, DirectionalSignal):
+                res = self._process_directional(signal, i, legs)
+            else:
+                logger.warning("未知的信号类型: %s，跳过", type(signal).__name__)
                 continue
-            total_cost = sum(
-                (t.price * t.quantity * (1 if t.side == OrderSide.BUY else -1))
-                + t.commission + t.slippage_cost
-                for t in legs
+            if res is not None:
+                results.append(res)
+        return results
+
+    def _process_arbitrage(
+        self,
+        signal: ArbitrageSignal,
+        idx: int,
+        legs: List[TradeRecord],
+    ) -> Optional[SignalPnLResult]:
+        if not legs:
+            # 无成交记录 = 信号被拒单或未执行，实际盈亏必须为 0
+            # ⚠️ 绝不能返回 signal.net_profit，否则产生未成交的"利润幻觉"
+            return SignalPnLResult(
+                signal_id=str(idx),
+                signal_type="Arbitrage",
+                gross_pnl=0.0,
+                net_pnl=0.0,
+                slippage_cost=0.0,
+                commission=0.0,
             )
-            pnls.append(-total_cost)
-        return pnls
+        commission    = sum(t.commission    for t in legs)
+        slippage_cost = sum(t.slippage_cost for t in legs)
+        # ⚠️ 必须乘以 t.multiplier 还原真实资金流水：
+        #   ETF 腿：multiplier=1，quantity=num_sets*unit，两者之积即总股数，正确
+        #   期权腿：multiplier=unit(10000)，quantity=num_sets，两者之积还原名义价值
+        cash_flow = sum(
+            t.price * t.quantity * t.multiplier * (1 if t.side == OrderSide.BUY else -1)
+            for t in legs
+        )
+        gross_pnl = -(cash_flow)
+        net_pnl   = -(cash_flow + commission + slippage_cost)
+        return SignalPnLResult(
+            signal_id=str(idx),
+            signal_type="Arbitrage",
+            gross_pnl=gross_pnl,
+            net_pnl=net_pnl,
+            slippage_cost=slippage_cost,
+            commission=commission,
+        )
+
+    def _process_directional(
+        self,
+        signal: DirectionalSignal,
+        idx: int,
+        legs: List[TradeRecord],
+    ) -> Optional[SignalPnLResult]:
+        # [FUTURE ARCHITECTURE NOTE]: 未来在此实现单边策略的盈亏归因
+        raise NotImplementedError("DirectionalSignal 的 PnL 统计尚未实现")
 
     @staticmethod
     def _calc_win_rate(pnls: List[float]) -> float:

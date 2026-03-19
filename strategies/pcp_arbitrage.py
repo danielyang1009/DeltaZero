@@ -29,7 +29,7 @@ from data_engine.tick_aligner import TickAligner
 from models import (
     ContractInfo,
     ETFTickData,
-    SignalType,
+    SignalAction,
     OptionTickData,
 )
 from models.data import MarketSnapshot
@@ -128,6 +128,9 @@ def _calc_close_metrics(
     P_bid: float,
     etf_fee_rate: float,
     option_rt_fee: float,
+    c_ask_vol: int = 0,
+    p_bid_vol: int = 0,
+    s_bid_vol: Optional[int] = None,
 ) -> Dict[str, Optional[float]]:
     """
     平仓 PCP 套利核心数学计算（模块级纯函数）。
@@ -135,14 +138,30 @@ def _calc_close_metrics(
     平仓方向：卖出 ETF + 卖出 Put + 买入 Call（与开仓反向）
     close_per_share = S_bid + P_bid - C_ask - K
     close_net = close_per_share * mult - S_bid * mult * etf_fee_rate - option_rt_fee
+
+    盘口容量（平仓方向承接能力）：
+      - 卖 ETF：受 ETF bid_volume 约束（接盘方），s_bid_vol 单位为手（100股）
+      - 卖 Put：受 Put bid_volumes[0] 约束
+      - 买 Call：受 Call ask_volumes[0] 约束
     """
     close_per_share = S_bid + P_bid - C_ask - K
     etf_fee         = S_bid * mult * etf_fee_rate
     close_net       = close_per_share * mult - etf_fee - option_rt_fee
 
+    max_qty: Optional[float] = None
+    if (
+        s_bid_vol is not None and s_bid_vol > 0
+        and mult > 0
+        and p_bid_vol > 0
+        and c_ask_vol > 0
+    ):
+        s_contracts = math.floor(s_bid_vol * 100 / mult)
+        max_qty = min(float(c_ask_vol), float(p_bid_vol), float(s_contracts))
+
     return {
         "close_per_share": close_per_share,
         "close_net":       close_net,
+        "max_qty":         max_qty,
     }
 
 
@@ -158,10 +177,12 @@ class PCPArbitrageStrategy(BaseStrategy):
     不持有任何市场行情状态（LKV 由外部 TickAligner 维护）。
 
     核心接口：
-      generate_signals(snapshot)              — 扫描 self._pairs，返回过阈值信号
-      scan_pairs_for_display(snapshot, pairs) — 无阈值过滤，供监控页面展示全量配对
-      scan_opportunities(snapshot, pairs)     — 有阈值过滤，供交易触发
-      scan_close_opportunities(snapshot, pairs) — 扫描平仓机会（CLOSE 信号）
+      generate_signals(snapshot)              — 统一信号入口：合并 OPEN + CLOSE 信号，需先 set_pairs()
+      scan_pairs_for_display(snapshot, pairs) — 展示专用：无阈值过滤，供 Monitor/market_cache 全量展示
+
+    内部私有方法（非对外接口）：
+      _scan_opportunities(snapshot, pairs)       — 有阈值过滤，生成 OPEN 信号
+      _scan_close_opportunities(snapshot, pairs) — 生成 CLOSE 信号
 
     使用示例：
         aligner  = TickAligner()
@@ -188,16 +209,19 @@ class PCPArbitrageStrategy(BaseStrategy):
 
     def generate_signals(self, snapshot: MarketSnapshot) -> List[ArbitrageSignal]:
         """
-        使用 self._pairs 扫描套利机会（含 min_profit_threshold 过滤）。
+        统一信号入口：合并 OPEN + CLOSE 信号（BaseStrategy 接口实现）。
 
         需先调用 set_pairs() 注入配对，否则返回空列表。
+        Engine 按 signal.action 自动分派 OPEN/CLOSE 执行路径。
         """
         if not self._pairs:
             return []
-        return self.scan_opportunities(snapshot, self._pairs)
+        open_signals  = self._scan_opportunities(snapshot, self._pairs)
+        close_signals = self._scan_close_opportunities(snapshot, self._pairs)
+        return open_signals + close_signals
 
     # ──────────────────────────────────────────────────────────
-    # 扫描接口（供 market_cache / backtest 调用）
+    # 展示接口（公开，供 Monitor / market_cache 使用）
     # ──────────────────────────────────────────────────────────
 
     def scan_pairs_for_display(
@@ -228,17 +252,21 @@ class PCPArbitrageStrategy(BaseStrategy):
         results.sort(key=lambda s: s.strike)
         return results
 
-    def scan_opportunities(
+    # ──────────────────────────────────────────────────────────
+    # 私有扫描方法（内部实现，不作为对外接口）
+    # ──────────────────────────────────────────────────────────
+
+    def _scan_opportunities(
         self,
         snapshot: MarketSnapshot,
         pairs: List[Tuple[ContractInfo, ContractInfo]],
         current_time: Optional[datetime] = None,
     ) -> List[ArbitrageSignal]:
         """
-        扫描套利机会，按 min_profit_threshold 过滤，按净利润降序排列。
+        扫描开仓套利机会，按 min_profit_threshold 过滤，按净利润降序排列。
 
         Returns:
-            满足阈值的 ArbitrageSignal 列表
+            满足阈值的 OPEN ArbitrageSignal 列表
         """
         ts = current_time or snapshot.ts
         results: List[ArbitrageSignal] = []
@@ -358,7 +386,7 @@ class PCPArbitrageStrategy(BaseStrategy):
             put_code=put_info.contract_code,
             expiry=call_info.expiry_date,
             strike=K,
-            direction=SignalType.FORWARD,
+            direction=1,
             net_profit=fwd_profit,
             # 执行价格（供 Portfolio 和展示层直接使用）
             call_bid=C_bid,
@@ -418,11 +446,19 @@ class PCPArbitrageStrategy(BaseStrategy):
         K    = call_info.strike_price
         mult = call_info.contract_unit
 
+        # 平仓盘口容量：卖 ETF/Put 看买方深度，买 Call 看卖方深度
+        c_ask_vol = _safe_level1_volume(call_tick.ask_volumes)
+        p_bid_vol = _safe_level1_volume(put_tick.bid_volumes)
+        s_bid_vol = etf_tick.bid_volume if etf_tick.bid_volume > 0 else None
+
         metrics = _calc_close_metrics(
             K=K, mult=mult,
             S_bid=S_bid, C_ask=C_ask, P_bid=P_bid,
             etf_fee_rate=self.config.etf_fee_rate,
             option_rt_fee=self.config.option_round_trip_fee,
+            c_ask_vol=c_ask_vol,
+            p_bid_vol=p_bid_vol,
+            s_bid_vol=s_bid_vol,
         )
 
         close_net = float(metrics["close_net"] or 0.0)
@@ -442,22 +478,22 @@ class PCPArbitrageStrategy(BaseStrategy):
             put_code=put_info.contract_code,
             expiry=call_info.expiry_date,
             strike=K,
-            direction=SignalType.REVERSE,
+            direction=-1,
+            action=SignalAction.CLOSE,
             net_profit=close_net,
             # 字段复用：CLOSE 语义下存平仓盘口价
             spot_ask=S_bid,   # 实为 ETF 买一（卖出用）
             put_ask=P_bid,    # 实为 Put 买一（卖出用）
             call_bid=C_ask,   # 实为 Call 卖一（买入用）
-            max_qty=None,     # 由 Engine 根据持仓决定
+            max_qty=metrics["max_qty"],   # 盘口流动性上限（由 Broker 裁剪）
             # 元信息
             calc_detail=calc_detail,
             multiplier=mult,
             is_adjusted=call_info.is_adjusted,
-            action="CLOSE",
             snapshot=snapshot,
         )
 
-    def scan_close_opportunities(
+    def _scan_close_opportunities(
         self,
         snapshot: MarketSnapshot,
         pairs: List[Tuple[ContractInfo, ContractInfo]],

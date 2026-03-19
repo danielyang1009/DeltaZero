@@ -31,7 +31,6 @@ from models import (
     ContractInfo,
     ETFTickData,
     OptionType,
-    SignalType,
     OptionTickData,
     normalize_code,
 )
@@ -334,8 +333,8 @@ def signal_to_dict(sig: ArbitrageSignal) -> dict:
     return {
         "expiry": sig.expiry.strftime("%m-%d"),
         "strike": sig.strike,
-        "direction": "正向" if sig.direction == SignalType.FORWARD else "反向",
-        "is_forward": sig.direction == SignalType.FORWARD,
+        "direction": "正向" if sig.direction == 1 else "反向",
+        "is_forward": sig.direction == 1,
         "call_bid": sig.call_bid,
         "put_ask": sig.put_ask,
         "spot": sig.spot_ask,

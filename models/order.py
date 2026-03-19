@@ -3,12 +3,13 @@
 信号、订单与账户模型
 
 职责分层：
-  ArbitrageSignal  — Alpha Model 输出：套利机会观察（展示 + 决策依据，不含执行意图）
+  BaseSignal       — 所有交易信号的抽象基类（ts, action, direction）
+  ArbitrageSignal  — Alpha Model 输出：多腿套利机会（继承 BaseSignal）
+  DirectionalSignal— 单边方向性信号占位（继承 BaseSignal，未来做市/投机用）
   LegOrder / Order — Execution Model 输入：执行层（broker / 回测撮合器）从 Signal 转化而来
   TradeRecord      — 成交记录（已执行，不可变）
   Position         — 单品种持仓（快照，由 Portfolio 维护）
   AccountState     — 账户全量快照
-  TradeSignal      — 向后兼容保留，Phase 3 后将被 ArbitrageSignal 替代
 """
 
 from __future__ import annotations
@@ -26,10 +27,10 @@ from models.data import MarketSnapshot
 # 枚举
 # ============================================================
 
-class SignalType(Enum):
-    """套利信号方向"""
-    FORWARD = "forward"    # 正向：买现货 + 买Put + 卖Call
-    REVERSE = "reverse"    # 反向：卖现货 + 卖Put + 买Call
+class SignalAction(Enum):
+    """信号动作：开仓 / 平仓"""
+    OPEN  = "OPEN"
+    CLOSE = "CLOSE"
 
 
 class OrderSide(Enum):
@@ -45,11 +46,28 @@ class AssetType(Enum):
 
 
 # ============================================================
+# 信号基类
+# ============================================================
+
+# [FUTURE ARCHITECTURE NOTE]:
+# 目前系统专注于无风险套利，统一使用 ArbitrageSignal。
+# 未来若引入单边投机或做市策略，需在此处抽象出一个纯粹的 BaseSignal (包含 ts, action, direction 等通用字段)，
+# 并让 ArbitrageSignal 和未来的 DirectionalSignal 继承自 BaseSignal，实现信号多态。
+
+@dataclass(kw_only=True)
+class BaseSignal:
+    """所有交易信号的抽象基类"""
+    ts: datetime
+    action: SignalAction = SignalAction.OPEN
+    direction: int = 1   # +1 = 正向/买, -1 = 反向/卖
+
+
+# ============================================================
 # Alpha Model 输出：ArbitrageSignal
 # ============================================================
 
-@dataclass
-class ArbitrageSignal:
+@dataclass(kw_only=True)
+class ArbitrageSignal(BaseSignal):
     """
     套利机会信号（Alpha Model 唯一输出）
 
@@ -61,13 +79,11 @@ class ArbitrageSignal:
       - 不含执行细节（无 Order、无成交价格假设）
       - snapshot 提供触发时刻的完整市场截面引用
     """
-    ts: datetime
     underlying: str             # 标的 ETF 代码，如 510050.SH
     call_code: str              # 认购合约代码
     put_code: str               # 认沽合约代码
     expiry: date                # 到期日
     strike: float               # 行权价
-    direction: SignalType       # 正向 / 反向
 
     # 核心收益指标
     net_profit: float                       # 扣费后净利润（元/组）
@@ -93,7 +109,17 @@ class ArbitrageSignal:
     calc_detail: str = ""                   # 人可读的盘口公式字符串
     multiplier: int  = 10000               # 合约单位（调整型合约可能不等于 10000）
     is_adjusted: bool = False              # 是否为分红调整型合约
-    action: str = "OPEN"                   # "OPEN" 或 "CLOSE"
+
+
+# ============================================================
+# 未来扩展占位：DirectionalSignal
+# ============================================================
+
+@dataclass(kw_only=True)
+class DirectionalSignal(BaseSignal):
+    """单边方向性信号（未来做市/投机策略占位）"""
+    contract_code: str
+    target_price: float
 
 
 # ============================================================
@@ -123,7 +149,7 @@ class Order:
     num_sets: int = 1           # 组数（所有腿的数量倍数）
 
     @property
-    def direction(self) -> SignalType:
+    def direction(self) -> int:
         return self.signal_ref.direction
 
 
@@ -198,47 +224,3 @@ class AccountState:
     def equity(self) -> float:
         """账户权益 = 现金 + 未实现盈亏"""
         return self.cash + self.unrealized_pnl
-
-
-# ============================================================
-# 向后兼容：TradeSignal（Phase 3 后将被 ArbitrageSignal 替代）
-# ============================================================
-
-@dataclass
-class TradeSignal:
-    """
-    PCP 套利交易信号（旧版，向后兼容保留）
-
-    Phase 3 重构完成后，此类型将被 ArbitrageSignal 替代。
-    新代码请使用 ArbitrageSignal。
-    """
-    timestamp: datetime
-    signal_type: SignalType
-    call_code: str
-    put_code: str
-    underlying_code: str
-    strike: float
-    expiry: date
-
-    # 触发时的市场价格快照
-    call_ask: float
-    call_bid: float
-    put_ask: float
-    put_bid: float
-    spot_price: float
-
-    # 理论与实际价差
-    theoretical_spread: float
-    actual_spread: float
-    net_profit_estimate: float
-    confidence: float = 0.0
-    multiplier: int = 10000
-    is_adjusted: bool = False
-    calc_detail: str = ""
-    max_qty: Optional[float] = None
-    spread_ratio: Optional[float] = None
-    obi_c: Optional[float] = None
-    obi_s: Optional[float] = None
-    obi_p: Optional[float] = None
-    net_1tick: Optional[float] = None
-    tolerance: Optional[float] = None

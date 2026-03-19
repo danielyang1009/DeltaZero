@@ -1,3 +1,2 @@
 from data_engine.tick_data_loader import TickLoader
 from data_engine.contract_catalog import ContractInfoManager
-from backtest.etf_price_simulator import ETFSimulator

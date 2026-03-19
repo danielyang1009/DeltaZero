@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 from config.settings import TradingConfig, get_default_config
-from models import ArbitrageSignal, ContractInfo, ETFTickData, SignalType
+from models import ArbitrageSignal, ContractInfo, ETFTickData
 
 logging.basicConfig(
     level=logging.INFO,
@@ -176,6 +176,7 @@ def run_backtest(
 
     aligner = TickAligner()
     pcp_strategy = PCPArbitrageStrategy(config)
+    pcp_strategy.set_pairs(all_pairs)
     engine = BacktestEngine(config)
     underlying_close = all_etf_ticks[0].price if all_etf_ticks else 3.0
 
@@ -185,9 +186,7 @@ def run_backtest(
         elif mtick.tick_type == "etf" and mtick.etf_tick is not None:
             aligner.update_etf(mtick.etf_tick)
         snapshot = aligner.snapshot()
-        open_signals  = pcp_strategy.scan_opportunities(snapshot, all_pairs)
-        close_signals = pcp_strategy.scan_close_opportunities(snapshot, all_pairs)
-        return open_signals + close_signals
+        return pcp_strategy.generate_signals(snapshot)
 
     results = engine.run(
         option_ticks=option_ticks,
@@ -228,7 +227,7 @@ def run_backtest(
     if results["signals"]:
         print("\n--- 套利信号摘要（前10条） ---")
         for i, sig in enumerate(results["signals"][:10]):
-            direction = "正向" if sig.direction == SignalType.FORWARD else "反向"
+            direction = "正向" if sig.direction == 1 else "反向"
             print(
                 f"  [{i + 1}] {sig.ts} | {direction} | "
                 f"K={sig.strike:.4f} | 净利润={sig.net_profit:.2f}元"

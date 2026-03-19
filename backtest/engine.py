@@ -22,7 +22,7 @@ from datetime import date, datetime
 from typing import Callable, Dict, List, Optional, Tuple
 
 from config.settings import TradingConfig
-from models import ArbitrageSignal, ContractInfo, ETFTickData, OptionTickData
+from models import ArbitrageSignal, ContractInfo, ETFTickData, OptionTickData, SignalAction
 from risk.margin import MarginCalculator
 
 from backtest.broker import BacktestBroker
@@ -106,7 +106,7 @@ class BacktestEngine:
                 self.signals_generated.append(signal)
                 total_signals += 1
 
-                if getattr(signal, 'action', 'OPEN') == 'CLOSE':
+                if signal.action == SignalAction.CLOSE:
                     # CLOSE 路径：由持仓决定组数，绕过 _calc_max_sets
                     current_date = mtick.timestamp.date()
                     num_sets = self._get_closeable_sets(signal, current_date)

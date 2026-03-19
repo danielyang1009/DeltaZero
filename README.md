@@ -340,6 +340,10 @@ xlsx 是 ZIP，`_load_topic_map()` 解析其中的 `xl/externalLinks/externalLin
 ## 最近变更
 
 - **集合竞价数据落盘**：`bus.py` 的 `_in_trading_hours()` 起始时间由 9:30 提前至 9:15，`parquet_writer.py` 的日终合并过滤同步调整，9:15–9:29 的集合竞价 tick 现可正常写盘并保留在合并后的日文件中
+- **generate_signals 统一入口**：`PCPArbitrageStrategy` 对外只暴露 `generate_signals(snapshot)`，内部合并 OPEN + CLOSE，Engine 按 `signal.action` 自动分派；`run.py` 回调简化为 `set_pairs` 一次初始化 + 单行 `generate_signals` 调用，移除旧的 `scan_opportunities` / `scan_close_opportunities` 分开调用模式
+- **Broker CLOSE 容量限制**：`_execute_close` 新增 `signal.max_qty` 截断逻辑，平仓路径与开仓路径对齐，禁止 Broker 内部读取盘口数据
+- **SignalAction 枚举类型安全**：`broker.py` / `engine.py` 的 action 判断由 `getattr(signal, 'action', 'OPEN') == 'CLOSE'` 改为 `signal.action == SignalAction.CLOSE`，消除隐式字符串比较
+- **删除遗留文件**：`_models_legacy.py`、`core/pricing.py`（旧 BlackScholes/IVCalculator）、`core/__init__.py`、sample_data 示例 CSV 已清理
 - **PnLAnalyzer 多态防腐层重构**：`analysis/pnl.py` 引入 `SignalPnLResult` DTO，将按信号类型分派的结算逻辑集中在 `_dispatch_signal_pnls`；`analyze` / `calc_greeks_attribution` 签名改为接收 `List[BaseSignal]`，不再硬绑 `ArbitrageSignal`。同步修正期权腿盈亏公式漏乘 `multiplier` 的历史 Bug（旧公式漏乘 `unit≈10000`，期权腿 PnL 数值严重失真）：资金流公式定死为 `cash_flow = Σ price × qty × multiplier × (BUY?1:-1)`，净利润为 `net_pnl = -(cash_flow + commission + slippage_cost)`；信号无成交时 `net_pnl` 强制返回 0.0，消除"利润幻觉"。`_process_directional` 以 `NotImplementedError` 占位，为未来单边策略预留扩展点。
 - **平仓闭环（Phase 6）**：回测引擎支持完整的仓位生命周期。`ArbitrageSignal` 新增 `action` 字段（`"OPEN"` / `"CLOSE"`），价格字段在 CLOSE 信号中语义翻转（`spot_ask` 存 ETF bid，`put_ask` 存 Put bid，`call_bid` 存 Call ask）；`PCPArbitrageStrategy` 新增 `scan_close_opportunities(snapshot, pairs)` 接口（策略仍无状态，不感知持仓）；`BacktestBroker` 新增 `_execute_close`（滑点方向反转，`margin_reserved=0`）；`Portfolio.process_trades` 新增保证金按比例释放（必须在 `_update_position` 之前执行）；`Engine` 新增 `_get_closeable_sets`（含 ETF T+1 冻结检查）并在主循环按 `action` 分派 OPEN/CLOSE 路径
 - **非交易时段 warning 修复**：策略层净利润异常检测由 `abs(profit) > 2000` 改为 `profit > 2000`，消除休市后盘口价差拉大导致的大量负利润 warning 刷屏
