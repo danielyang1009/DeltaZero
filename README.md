@@ -62,7 +62,7 @@ ETF 期权 PCP 套利工具，采用四层流水线结构：
               │                                     │
               ▼                                     ▼
 【管线 A 终点：视觉展示】                  【管线 B 终点：执行与账务】
-[ monitors/monitor.py ]                [ backtest/engine.py & broker.py ]
+[ monitors/monitor.py ]                [ backtest/engine.py ]  (broker.py: Phase 5 待建)
 [ web/market_cache.py ]                - 哨兵拦截 (999999.0 拒单)
 - Rich UI 终端渲染                     - 买卖价差撮合 (跨价撮合)
 - WebSocket 推送                       - 容量限制裁剪 (Volume Constraint)
@@ -87,7 +87,7 @@ python console.py
 
 1. 打开 无限易
 2. 在无限易中对所需合约选择导出DDE（真实开门机制，若已初始化无需再打开Excel）。
-3. **9:25 前**启动 DataBus（DDE 连接热身需 1-5 秒，提前启动确保 9:30:00 开盘 tick 被落盘）。
+3. **9:14 前**启动 DataBus，以确保完整捕获 9:15–9:25 集合竞价期间的全部动态行情快照，为未来的高频 Alpha 挖掘提供完整的微观数据支持。
 4. 启动 Monitor。
 5. 收盘后执行"合并今日分片"并关闭进程。
 
@@ -128,12 +128,17 @@ python -m monitors.monitor --zmq-port 5555
 ## 模块命名（当前标准）
 
 - `data_engine.bond_termstructure_fetcher`：从 Shibor 官网与中债官网爬取当日期限结构，横表落盘
-- `data_engine.contract_catalog`
+- `data_engine.contract_catalog`：合约元数据加载与查询（`ContractInfoManager`）
+- `data_engine.tick_aligner`：`TickAligner`，市场状态 LKV 容器，生成 `MarketSnapshot`
 - `data_engine.tick_data_loader`
 - `data_engine.bar_data_loader`
 - `data_bus.dde_direct_client`：纯 Python DDE 直连行情软件（ctypes DDEML，Excel 无需运行，topic 来自 `wxy_options.xlsx`）
-- `calculators.vectorized_pricer`：Black-76 IV 求解器（Brent 法，GUARD-1/2/3）
+- `strategies.base`：`BaseStrategy` 抽象基类，所有策略必须继承
+- `strategies.pcp_arbitrage`：`PCPArbitrageStrategy`，无状态 PCP 套利策略
+- `backtest.data_feed`：`HistoricalFeed`，历史 Parquet 数据流生成
+- `backtest.portfolio`：`Portfolio`，回测撮合与资金账务
 - `backtest.etf_price_simulator`
+- `calculators.vectorized_pricer`：Black-76 IV 求解器（Brent 法，GUARD-1/2/3）
 
 ## 数据目录约定
 
@@ -333,11 +338,11 @@ xlsx 是 ZIP，`_load_topic_map()` 解析其中的 `xl/externalLinks/externalLin
 
 ## 最近变更
 
-- **架构重构（Phase 3/4）**：`TickAligner`（`data_engine/tick_aligner.py`）独立为市场状态容器，`PCPArbitrageStrategy`（`strategies/pcp_arbitrage.py`）改为无状态策略，接收 `MarketSnapshot` 作为输入；信号类型由 `TradeSignal` 升级为 `ArbitrageSignal`；`monitors/monitor.py` 与 `web/market_cache.py` 均已迁移至新架构
+- **架构重构（Phase 3/4）**：`TickAligner`（`data_engine/tick_aligner.py`）独立为市场状态容器，`PCPArbitrageStrategy`（`strategies/pcp_arbitrage.py`）改为无状态策略，接收 `MarketSnapshot` 作为输入；信号类型由 `TradeSignal` 升级为 `ArbitrageSignal`；期权 tick 数据类型由 `TickData` 更名为 `OptionTickData`（语义明确化）；`monitors/monitor.py` 与 `web/market_cache.py` 均已迁移至新架构
 - **models 包重组**：`models.py` 拆分为 `models/data.py`（市场数据类）和 `models/order.py`（信号/订单类），顶层 `models/__init__.py` 保持向后兼容，原有 `from models import ...` 语句无需修改
 - **回测引擎解耦**：`backtest/engine.py` 精简为编排层，撮合逻辑迁至 `backtest/portfolio.py`，数据流生成迁至 `backtest/data_feed.py`；`run()` 接口签名不变
 - **移除 Wind 数据源**：删除 `WindSubscriber`、`WindAdapter`、`wind_helpers`、`optionchain_fetcher`；DataBus 仅保留 DDE 模式，`--source` 参数只接受 `dde`；控制台移除"抓取期权链"入口
-- **DataBus 开盘 tick 保全**：`bus.py` 主循环改为每条 tick 独立取实时墙钟判断交易时段，消除批量处理 1000 条时 9:30:00 边界处的竞态窗口；**建议每日 9:25 前启动 DataBus**
+- **DataBus 开盘 tick 保全**：`bus.py` 主循环改为每条 tick 独立取实时墙钟判断交易时段，消除批量处理 1000 条时 9:30:00 边界处的竞态窗口；**建议每日 9:14 前启动 DataBus**
 - **Web Monitor 二级折叠**：表格新增"到期日+合约类型"层级折叠（默认展开），方向列改为左对齐
 - **Web Monitor 显示优化**：净利润/Net_1T 改为整数显示（与终端一致）；新增方向列（正向/空，三档配色）；IV 标签移至表头正向/≥N元之后，配对/有报价保留右对齐；品种名加粗；各品种默认折叠；行高固定 26px 防抖动
 - **交易日计算后移后端**：`utils/time_utils` 新增 `trading_days_until()`（akshare 日历，回退工作日），`market_cache` 序列化时附加 `expiry_info`（自然日/交易日），前端不再自行计算；终端 monitor 私有函数提升为共用工具
