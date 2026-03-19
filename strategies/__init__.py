@@ -1,1 +1,1 @@
-from strategies.pcp_arbitrage import PCPArbitrage
+from strategies.pcp_arbitrage import PCPArbitrageStrategy

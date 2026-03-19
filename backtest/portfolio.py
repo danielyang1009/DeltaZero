@@ -1,19 +1,16 @@
 # -*- coding: utf-8 -*-
 """
-资金与保证金引擎（Portfolio）
+资金与保证金引擎（Portfolio）—— 纯会计层
 
-从 backtest/engine.py 的 Account 类提取，专注于资金管理职责。
+Phase 5 重构：撮合职责已完全移入 backtest/broker.py（BacktestBroker）。
+Portfolio 仅负责：
+  - 记账（现金流水、持仓均价、已实现盈亏）
+  - 保证金冻结跟踪
+  - 账户快照生成
 
-实盘微观机制四条规则（在 apply_signal() 中严格执行）：
-  1. 跨价撮合：BUY 对齐 ask1，SELL 对齐 bid1，绝不使用 last 价
-  2. 哨兵值拦截：ask1=999999.0 或 bid1=0.0 → 认定为废单，拒绝成交
-  3. 容量限制：成交组数不超过 signal.max_qty（策略侧已按盘口量约束）
-  4. 保证金前置校验：卖出开仓前验证可用资金，不足则拒绝
-
-职责边界：
-  - Portfolio 只负责"结算"（资金流水、持仓更新、盈亏记录）
-  - 不感知 ZMQ / Parquet / 策略逻辑
-  - 由 BacktestEngine 驱动调用
+调用方式：
+  trades = broker.execute_signal(signal, ...)
+  portfolio.process_trades(trades)
 """
 
 from __future__ import annotations
@@ -29,25 +26,18 @@ from models import (
     ContractInfo,
     OrderSide,
     Position,
-    SignalType,
     TradeRecord,
-    TradeSignal,
 )
-from risk.margin import MarginCalculator
 
 logger = logging.getLogger(__name__)
-
-# 哨兵值常量（来自交易软件的无效盘口标记）
-_SENTINEL_ASK  = 999999.0
-_SENTINEL_BID  = 0.0
 
 
 class Portfolio:
     """
-    资金与保证金引擎
+    资金与保证金引擎（纯会计层）
 
     维护现金、持仓、保证金占用和已实现盈亏。
-    每次 apply_signal() 完成四条实盘微观机制校验后再模拟成交。
+    由 BacktestEngine 在收到 Broker 返回的 TradeRecord 列表后调用 process_trades()。
 
     Attributes:
         cash:          当前可用现金
@@ -71,41 +61,63 @@ class Portfolio:
     # 公开接口
     # ──────────────────────────────────────────────────────────
 
-    def apply_signal(
-        self,
-        signal: TradeSignal,
-        margin_calculator: MarginCalculator,
-        contracts: Dict[str, ContractInfo],
-        underlying_close: float,
-        num_sets: int = 1,
-        signal_id: Optional[int] = None,
-    ) -> List[TradeRecord]:
+    def process_trades(self, trades: List[TradeRecord]) -> None:
         """
-        执行套利信号（含四条实盘微观机制校验）
+        批量记账：处理 Broker 返回的成交记录列表
 
-        Args:
-            signal:            交易信号（TradeSignal，向后兼容）
-            margin_calculator: 保证金计算器
-            contracts:         合约信息字典
-            underlying_close:  标的前收盘价（保证金计算用）
-            num_sets:          拟开仓组数
-            signal_id:         关联的信号序号（用于追溯）
-
-        Returns:
-            成交记录列表；任一校验不通过则返回空列表
+        每笔 TradeRecord 按顺序执行：
+          1. 分配唯一 trade_id
+          2. 现金流（direction * price * qty * multiplier + fee）
+          3. 保证金释放（平仓买入 Call 时，在持仓更新前按比例释放）
+          4. 持仓更新（均价 / 已实现盈亏）
+          5. ETF T+1 约束跟踪
+          6. 保证金冻结（仅 Call 卖出腿）
+          7. 追加到 trade_history
         """
-        if signal.signal_type == SignalType.FORWARD:
-            return self._execute_forward(
-                signal, margin_calculator, contracts,
-                underlying_close, num_sets, signal_id,
+        for trade in trades:
+            # 1. 分配唯一 trade_id
+            self._trade_counter += 1
+            trade.trade_id = self._trade_counter
+
+            # 2. 现金流
+            self.cash -= (
+                trade.direction * trade.price * trade.quantity * trade.multiplier
+            ) + trade.fee
+            self.total_commission += trade.fee
+
+            # 3. 保证金释放（平仓买入 Call 时，按比例释放已冻结保证金）
+            #    ⚠️ 必须在 _update_position 之前执行（此时 pos.quantity 仍是平仓前的值）
+            if (trade.asset_type == AssetType.OPTION
+                    and trade.direction == 1
+                    and trade.contract_code in self.positions):
+                pos = self.positions[trade.contract_code]
+                if pos.quantity < 0 and pos.margin_occupied > 0:
+                    close_qty    = min(trade.quantity, abs(pos.quantity))
+                    release_ratio = close_qty / abs(pos.quantity)
+                    released     = pos.margin_occupied * release_ratio
+                    pos.margin_occupied -= released
+                    self.total_margin   -= released
+
+            # 4. 持仓更新
+            side = OrderSide.BUY if trade.direction > 0 else OrderSide.SELL
+            self._update_position(
+                trade.contract_code, trade.asset_type, side,
+                trade.price, trade.quantity,
             )
-        elif signal.signal_type == SignalType.REVERSE:
-            logger.info(
-                "检测到反向套利信号（A股做空受限，仅记录）: Strike=%.4f, 预估利润=%.2f",
-                signal.strike, signal.net_profit_estimate,
-            )
-            return []
-        return []
+
+            # 5. ETF T+1 约束跟踪
+            if trade.asset_type == AssetType.ETF and trade.direction > 0:
+                self._etf_buy_dates[trade.contract_code] = trade.timestamp.date()
+
+            # 6. 保证金冻结（仅 Call 卖出腿 margin_reserved > 0）
+            if trade.margin_reserved > 0:
+                pos = self.positions.get(trade.contract_code)
+                if pos:
+                    pos.margin_occupied += trade.margin_reserved
+                self.total_margin += trade.margin_reserved
+
+            # 7. 记录
+            self.trade_history.append(trade)
 
     def mark_to_market(
         self,
@@ -156,167 +168,7 @@ class Portfolio:
         )
 
     # ──────────────────────────────────────────────────────────
-    # 内部撮合逻辑
-    # ──────────────────────────────────────────────────────────
-
-    def _execute_forward(
-        self,
-        signal: TradeSignal,
-        margin_calculator: MarginCalculator,
-        contracts: Dict[str, ContractInfo],
-        underlying_close: float,
-        num_sets: int,
-        signal_id: Optional[int],
-    ) -> List[TradeRecord]:
-        """
-        正向套利三腿撮合：买 ETF（ask1）+ 买 Put（ask1）+ 卖 Call（bid1）
-
-        四条微观机制校验顺序：
-          1/2 → 3 → 4 → 执行
-        """
-        unit = signal.multiplier
-        fee  = self.config.fee
-        slp  = self.config.slippage
-
-        # ── 规则 1 & 2：跨价撮合 + 哨兵值绝对拦截 ─────────────────
-        #
-        # BUY Put  → 对齐 ask1（signal.put_ask）
-        # SELL Call → 对齐 bid1（signal.call_bid）
-        # BUY ETF  → 对齐 ask1（signal.spot_price，策略侧已取 etf_ask）
-        #
-        put_exec   = signal.put_ask
-        call_exec  = signal.call_bid
-        etf_exec   = signal.spot_price
-
-        if put_exec >= _SENTINEL_ASK or put_exec <= 0:
-            logger.warning(
-                "规则2：Put ask1=%.4f 触发哨兵值，废单（K=%.4f %s）",
-                put_exec, signal.strike, signal.expiry,
-            )
-            return []
-
-        if call_exec <= _SENTINEL_BID:
-            logger.warning(
-                "规则2：Call bid1=%.4f 为零，废单（K=%.4f %s）",
-                call_exec, signal.strike, signal.expiry,
-            )
-            return []
-
-        if etf_exec >= _SENTINEL_ASK or etf_exec <= 0:
-            logger.warning(
-                "规则2：ETF 价格=%.4f 触发哨兵值，废单",
-                etf_exec,
-            )
-            return []
-
-        # 加滑点（跨价撮合已对齐盘口，再加一档模拟冲击成本）
-        put_exec  += slp.option_slippage_ticks * slp.option_tick_size
-        call_exec -= slp.option_slippage_ticks * slp.option_tick_size
-        etf_exec  += slp.etf_slippage_ticks    * slp.etf_tick_size
-
-        # ── 规则 3：容量限制 ────────────────────────────────────────
-        #
-        # signal.max_qty 由策略在生成信号时按盘口量（min(call_bidv1, put_askv1, etf_askv1)）计算。
-        # 此处作为硬性上限，防止超量成交。
-        #
-        if signal.max_qty is not None and num_sets > signal.max_qty:
-            capped = max(1, int(signal.max_qty))
-            logger.debug(
-                "规则3：容量限制，num_sets %d → %d（max_qty=%.1f）",
-                num_sets, capped, signal.max_qty,
-            )
-            num_sets = capped
-
-        # ── 规则 4：保证金前置校验 ──────────────────────────────────
-        #
-        # 卖出 Call（Short Open）在成交前必须确认可用资金充足。
-        # 若不足，整单拒绝（模拟"冻结失败"）。
-        #
-        call_info = contracts.get(signal.call_code)
-        if call_info is None:
-            logger.warning("规则4：未找到 Call 合约信息: %s", signal.call_code)
-            return []
-
-        margin_result    = margin_calculator.calc_initial_margin(
-            call_info, call_exec, underlying_close,
-        )
-        required_margin  = margin_result.initial_margin * num_sets
-
-        etf_quantity = num_sets * unit
-        etf_cost     = etf_exec * etf_quantity
-        etf_comm     = max(etf_cost * fee.etf_commission_rate, fee.etf_min_commission)
-        put_cost     = put_exec  * unit * num_sets
-        put_comm     = fee.option_commission_per_contract * num_sets
-        call_revenue = call_exec * unit * num_sets
-        call_comm    = fee.option_commission_per_contract * num_sets
-
-        total_outflow = etf_cost + put_cost + etf_comm + put_comm + call_comm - call_revenue
-        required_cash = total_outflow + required_margin
-
-        if self.cash < required_cash:
-            logger.info(
-                "规则4：资金不足，需 %.2f，可用 %.2f（K=%.4f，跳过）",
-                required_cash, self.cash, signal.strike,
-            )
-            return []
-
-        # ── 执行三腿成交 ─────────────────────────────────────────────
-        records: List[TradeRecord] = []
-
-        # ETF 买入（ask1 + 滑点）
-        records.append(self._record_trade(
-            signal.timestamp, AssetType.ETF, signal.underlying_code,
-            OrderSide.BUY, etf_exec, etf_quantity, etf_comm,
-            slp.etf_slippage_ticks * slp.etf_tick_size * etf_quantity,
-            signal_id=signal_id,
-        ))
-        self._update_position(
-            signal.underlying_code, AssetType.ETF,
-            OrderSide.BUY, etf_exec, etf_quantity, contracts=contracts,
-        )
-        self._etf_buy_dates[signal.underlying_code] = signal.timestamp.date()
-        self.cash -= (etf_cost + etf_comm)
-
-        # Put 买入（ask1 + 滑点）
-        records.append(self._record_trade(
-            signal.timestamp, AssetType.OPTION, signal.put_code,
-            OrderSide.BUY, put_exec, num_sets, put_comm,
-            slp.option_slippage_ticks * slp.option_tick_size * unit * num_sets,
-            signal_id=signal_id,
-        ))
-        self._update_position(
-            signal.put_code, AssetType.OPTION,
-            OrderSide.BUY, put_exec, num_sets, contracts=contracts,
-        )
-        self.cash -= (put_cost + put_comm)
-
-        # Call 卖出（bid1 - 滑点）
-        records.append(self._record_trade(
-            signal.timestamp, AssetType.OPTION, signal.call_code,
-            OrderSide.SELL, call_exec, num_sets, call_comm,
-            slp.option_slippage_ticks * slp.option_tick_size * unit * num_sets,
-            signal_id=signal_id,
-        ))
-        self._update_position(
-            signal.call_code, AssetType.OPTION,
-            OrderSide.SELL, call_exec, num_sets, contracts=contracts,
-        )
-        self.cash += (call_revenue - call_comm)
-
-        # 冻结保证金
-        pos = self.positions.get(signal.call_code)
-        if pos:
-            pos.margin_occupied = required_margin
-        self.total_margin += required_margin
-
-        logger.info(
-            "正向套利成交: Strike=%.4f, Expiry=%s, 组数=%d, 保证金=%.2f",
-            signal.strike, signal.expiry, num_sets, required_margin,
-        )
-        return records
-
-    # ──────────────────────────────────────────────────────────
-    # 持仓与成交记录工具
+    # 持仓工具（内部）
     # ──────────────────────────────────────────────────────────
 
     def _update_position(
@@ -361,34 +213,3 @@ class Portfolio:
 
             if abs(signed_qty) > close_qty and pos.quantity != 0:
                 pos.avg_cost = price
-
-    def _record_trade(
-        self,
-        timestamp: datetime,
-        asset_type: AssetType,
-        code: str,
-        side: OrderSide,
-        price: float,
-        quantity: int,
-        commission: float,
-        slippage_cost: float,
-        signal_id: Optional[int] = None,
-    ) -> TradeRecord:
-        """生成并记录一笔成交"""
-        self._trade_counter += 1
-        self.total_commission += commission
-
-        record = TradeRecord(
-            trade_id=self._trade_counter,
-            timestamp=timestamp,
-            asset_type=asset_type,
-            contract_code=code,
-            side=side,
-            price=price,
-            quantity=quantity,
-            commission=commission,
-            slippage_cost=slippage_cost,
-            signal_id=signal_id,
-        )
-        self.trade_history.append(record)
-        return record

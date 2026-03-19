@@ -93,6 +93,7 @@ class ArbitrageSignal:
     calc_detail: str = ""                   # 人可读的盘口公式字符串
     multiplier: int  = 10000               # 合约单位（调整型合约可能不等于 10000）
     is_adjusted: bool = False              # 是否为分红调整型合约
+    action: str = "OPEN"                   # "OPEN" 或 "CLOSE"
 
 
 # ============================================================
@@ -148,6 +149,15 @@ class TradeRecord:
     commission: float
     slippage_cost: float
     signal_id: Optional[int] = None   # 关联的信号序号
+
+    # 记账用字段（带默认值，向后兼容）
+    direction: int = 1          # +1=买入, -1=卖出
+    multiplier: int = 1         # 合约乘数：ETF 腿为 1，期权腿为 contract_unit
+    margin_reserved: float = 0.0  # 仅 Call 卖出腿非零（单位：元）
+
+    @property
+    def fee(self) -> float:
+        return self.commission
 
 
 # ============================================================

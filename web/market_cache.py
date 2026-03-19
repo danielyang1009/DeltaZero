@@ -462,7 +462,7 @@ def _monitor_compute_loop() -> None:
     from models import ETFTickData
     from strategies.pcp_arbitrage import PCPArbitrageStrategy
 
-    # ── 初始化（仅加载合约元数据，不创建旧 PCPArbitrage）──────────────
+    # ── 初始化：加载合约元数据 + 创建 TickAligner / PCPArbitrageStrategy ──
     def _init_components():
         snap = get_snapshot()
         etf_prices: Dict[str, float] = {}
@@ -475,9 +475,9 @@ def _monitor_compute_loop() -> None:
         path = get_optionchain_path()
         mtime = path.stat().st_mtime if path.exists() else None
 
-        # 用 init_strategy_and_contracts 只取合约元数据（忽略返回的旧 PCPArbitrage 实例）
+        # 用 init_strategy_and_contracts 取合约元数据（忽略返回的旧策略实例）
         from config.settings import get_default_config
-        _strat_unused, contract_mgr, active, pairs, option_codes, etf_codes = (
+        _, contract_mgr, active, pairs, option_codes, etf_codes = (
             init_strategy_and_contracts(
                 min_profit=DEFAULT_MIN_PROFIT,
                 expiry_days=DEFAULT_EXPIRY_DAYS,

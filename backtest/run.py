@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 from config.settings import TradingConfig, get_default_config
-from models import ContractInfo, ETFTickData, SignalType, TradeSignal
+from models import ArbitrageSignal, ContractInfo, ETFTickData, SignalType
 
 logging.basicConfig(
     level=logging.INFO,
@@ -39,7 +39,8 @@ def run_backtest(
     from data_engine.contract_catalog import ContractInfoManager, get_optionchain_path
     from backtest.etf_price_simulator import ETFSimulator
     from data_engine.tick_data_loader import TickLoader
-    from strategies.pcp_arbitrage import PCPArbitrage
+    from data_engine.tick_aligner import TickAligner
+    from strategies.pcp_arbitrage import PCPArbitrageStrategy
 
     logger.info("=" * 60)
     logger.info("Step 1: 加载合约基本信息")
@@ -173,16 +174,20 @@ def run_backtest(
     logger.info("Step 5: 执行 Tick-by-Tick 回测")
     logger.info("=" * 60)
 
-    strategy = PCPArbitrage(config)
+    aligner = TickAligner()
+    pcp_strategy = PCPArbitrageStrategy(config)
     engine = BacktestEngine(config)
     underlying_close = all_etf_ticks[0].price if all_etf_ticks else 3.0
 
-    def strategy_callback(mtick: MergedTick, bt_engine: BacktestEngine) -> List[TradeSignal]:
+    def strategy_callback(mtick: MergedTick, bt_engine: BacktestEngine) -> List[ArbitrageSignal]:
         if mtick.tick_type == "option" and mtick.option_tick is not None:
-            strategy.on_option_tick(mtick.option_tick)
+            aligner.update_option(mtick.option_tick)
         elif mtick.tick_type == "etf" and mtick.etf_tick is not None:
-            strategy.on_etf_tick(mtick.etf_tick)
-        return strategy.scan_opportunities(all_pairs, mtick.timestamp)
+            aligner.update_etf(mtick.etf_tick)
+        snapshot = aligner.snapshot()
+        open_signals  = pcp_strategy.scan_opportunities(snapshot, all_pairs)
+        close_signals = pcp_strategy.scan_close_opportunities(snapshot, all_pairs)
+        return open_signals + close_signals
 
     results = engine.run(
         option_ticks=option_ticks,
@@ -223,11 +228,10 @@ def run_backtest(
     if results["signals"]:
         print("\n--- 套利信号摘要（前10条） ---")
         for i, sig in enumerate(results["signals"][:10]):
-            direction = "正向" if sig.signal_type == SignalType.FORWARD else "反向"
+            direction = "正向" if sig.direction == SignalType.FORWARD else "反向"
             print(
-                f"  [{i + 1}] {sig.timestamp} | {direction} | "
-                f"K={sig.strike:.4f} | 预估利润={sig.net_profit_estimate:.2f}元 | "
-                f"置信度={sig.confidence:.2f}"
+                f"  [{i + 1}] {sig.ts} | {direction} | "
+                f"K={sig.strike:.4f} | 净利润={sig.net_profit:.2f}元"
             )
 
 

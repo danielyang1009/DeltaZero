@@ -18,13 +18,14 @@ Tick-by-Tick 回测编排引擎（重构版）
 from __future__ import annotations
 
 import logging
-from datetime import datetime
+from datetime import date, datetime
 from typing import Callable, Dict, List, Optional, Tuple
 
 from config.settings import TradingConfig
-from models import ContractInfo, ETFTickData, OptionTickData, TradeSignal
+from models import ArbitrageSignal, ContractInfo, ETFTickData, OptionTickData
 from risk.margin import MarginCalculator
 
+from backtest.broker import BacktestBroker
 from backtest.data_feed import HistoricalFeed, MergedTick   # noqa: F401  (re-export MergedTick)
 from backtest.portfolio import Portfolio
 
@@ -51,8 +52,9 @@ class BacktestEngine:
     def __init__(self, config: TradingConfig) -> None:
         self.config             = config
         self.portfolio          = Portfolio(config.initial_capital, config)
+        self.broker             = BacktestBroker(config)
         self.margin_calculator  = MarginCalculator(config)
-        self.signals_generated: List[TradeSignal]           = []
+        self.signals_generated: List[ArbitrageSignal]       = []
         self.equity_curve: List[Tuple[datetime, float]]     = []
         self._price_cache: Dict[str, float]                 = {}
         self.contracts: Dict[str, ContractInfo]             = {}
@@ -68,7 +70,7 @@ class BacktestEngine:
         contracts: Dict[str, ContractInfo],
         strategy_callback: Callable[
             [MergedTick, "BacktestEngine"],
-            List[TradeSignal],
+            List[ArbitrageSignal],
         ],
         underlying_close: Optional[float] = None,
     ) -> Dict:
@@ -104,18 +106,31 @@ class BacktestEngine:
                 self.signals_generated.append(signal)
                 total_signals += 1
 
-                num_sets = min(
-                    self.config.max_position_per_signal,
-                    self._calc_max_sets(signal, underlying_close or 0),
-                )
-                if num_sets <= 0:
-                    continue
+                if getattr(signal, 'action', 'OPEN') == 'CLOSE':
+                    # CLOSE 路径：由持仓决定组数，绕过 _calc_max_sets
+                    current_date = mtick.timestamp.date()
+                    num_sets = self._get_closeable_sets(signal, current_date)
+                    if num_sets <= 0:
+                        continue
+                else:
+                    # OPEN 路径：现有逻辑不变
+                    num_sets = min(
+                        self.config.max_position_per_signal,
+                        self._calc_max_sets(signal, underlying_close or 0),
+                    )
+                    if num_sets <= 0:
+                        continue
 
-                trades = self.portfolio.apply_signal(
-                    signal, self.margin_calculator, contracts,
-                    underlying_close or 0, num_sets,
+                trades = self.broker.execute_signal(
+                    signal, num_sets,
+                    available_cash=self.portfolio.cash,
+                    margin_calculator=self.margin_calculator,
+                    contracts=contracts,
+                    underlying_close=underlying_close or 0,
                     signal_id=sig_idx,
                 )
+                if trades:
+                    self.portfolio.process_trades(trades)
                 total_trades += len(trades)
 
             # 每 100 tick 采样一次权益（避免每 tick 都调 mark_to_market 拖慢速度）
@@ -153,10 +168,10 @@ class BacktestEngine:
     # 内部工具
     # ──────────────────────────────────────────────────────────
 
-    def _calc_max_sets(self, signal: TradeSignal, underlying_close: float) -> int:
-        """根据可用资金估算最大开仓组数（粗估，精确校验在 Portfolio.apply_signal）"""
+    def _calc_max_sets(self, signal: ArbitrageSignal, underlying_close: float) -> int:
+        """根据可用资金估算最大开仓组数（粗估，精确校验在 BacktestBroker.execute_signal）"""
         unit           = signal.multiplier
-        etf_cost_est   = signal.spot_price * unit
+        etf_cost_est   = signal.spot_ask * unit
         margin_est     = underlying_close * unit * self.config.margin.call_margin_ratio_1
         cost_per_set   = etf_cost_est + margin_est
 
@@ -165,6 +180,34 @@ class BacktestEngine:
 
         max_sets = int(self.portfolio.cash * 0.8 / cost_per_set)
         return max(0, min(max_sets, self.config.max_position_per_signal))
+
+    def _get_closeable_sets(self, signal: ArbitrageSignal, current_date: date) -> int:
+        """
+        从 Portfolio 提取实际可平仓组数。
+
+        约束：min(|Call空头|, Put多头, ETF多头 // unit)
+        ⚠️ ETF T+1：今日买入的 ETF 当天不可卖出，返回 0
+        """
+        call_pos = self.portfolio.positions.get(signal.call_code)
+        put_pos  = self.portfolio.positions.get(signal.put_code)
+        etf_pos  = self.portfolio.positions.get(signal.underlying)
+
+        if not (call_pos and call_pos.quantity < 0
+                and put_pos and put_pos.quantity > 0
+                and etf_pos and etf_pos.quantity > 0):
+            return 0
+
+        # T+1 冻结检查：ETF 今日买入不可卖出
+        etf_buy_date = self.portfolio._etf_buy_dates.get(signal.underlying)
+        if etf_buy_date is not None and etf_buy_date == current_date:
+            return 0
+
+        unit = signal.multiplier
+        return min(
+            abs(call_pos.quantity),
+            put_pos.quantity,
+            etf_pos.quantity // unit,
+        )
 
     def _get_latest_prices(self, mtick: MergedTick) -> Dict[str, float]:
         """逐 Tick 维护价格缓存，供 mark_to_market 使用"""

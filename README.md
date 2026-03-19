@@ -62,7 +62,7 @@ ETF 期权 PCP 套利工具，采用四层流水线结构：
               │                                     │
               ▼                                     ▼
 【管线 A 终点：视觉展示】                  【管线 B 终点：执行与账务】
-[ monitors/monitor.py ]                [ backtest/engine.py ]  (broker.py: Phase 5 待建)
+[ monitors/monitor.py ]                [ backtest/broker.py + engine.py ]
 [ web/market_cache.py ]                - 哨兵拦截 (999999.0 拒单)
 - Rich UI 终端渲染                     - 买卖价差撮合 (跨价撮合)
 - WebSocket 推送                       - 容量限制裁剪 (Volume Constraint)
@@ -136,7 +136,8 @@ python -m monitors.monitor --zmq-port 5555
 - `strategies.base`：`BaseStrategy` 抽象基类，所有策略必须继承
 - `strategies.pcp_arbitrage`：`PCPArbitrageStrategy`，无状态 PCP 套利策略
 - `backtest.data_feed`：`HistoricalFeed`，历史 Parquet 数据流生成
-- `backtest.portfolio`：`Portfolio`，回测撮合与资金账务
+- `backtest.broker`：`BacktestBroker`，四条微观校验 + FOK 撮合（OPEN），`_execute_close` 处理 CLOSE 信号（Phase 5/6）
+- `backtest.portfolio`：`Portfolio`，纯会计层（记账 / 持仓 / 快照）
 - `backtest.etf_price_simulator`
 - `calculators.vectorized_pricer`：Black-76 IV 求解器（Brent 法，GUARD-1/2/3）
 
@@ -338,6 +339,9 @@ xlsx 是 ZIP，`_load_topic_map()` 解析其中的 `xl/externalLinks/externalLin
 
 ## 最近变更
 
+- **平仓闭环（Phase 6）**：回测引擎支持完整的仓位生命周期。`ArbitrageSignal` 新增 `action` 字段（`"OPEN"` / `"CLOSE"`），价格字段在 CLOSE 信号中语义翻转（`spot_ask` 存 ETF bid，`put_ask` 存 Put bid，`call_bid` 存 Call ask）；`PCPArbitrageStrategy` 新增 `scan_close_opportunities(snapshot, pairs)` 接口（策略仍无状态，不感知持仓）；`BacktestBroker` 新增 `_execute_close`（滑点方向反转，`margin_reserved=0`）；`Portfolio.process_trades` 新增保证金按比例释放（必须在 `_update_position` 之前执行）；`Engine` 新增 `_get_closeable_sets`（含 ETF T+1 冻结检查）并在主循环按 `action` 分派 OPEN/CLOSE 路径
+- **非交易时段 warning 修复**：策略层净利润异常检测由 `abs(profit) > 2000` 改为 `profit > 2000`，消除休市后盘口价差拉大导致的大量负利润 warning 刷屏
+- **执行层解耦（Phase 5）**：新增 `backtest/broker.py`（`BacktestBroker`），撮合职责从 `Portfolio._execute_forward` 完全迁移至 `Broker.execute_signal()`（四条微观校验：哨兵拦截 / 跨价撮合 / 容量限制 / 保证金前置校验，FOK 语义）；`Portfolio` 退化为纯会计层，新增 `process_trades()` 方法；`Engine` 显式编排三步流水线（策略 → Broker → Portfolio）；`TradeRecord` 新增 `direction` / `multiplier` / `margin_reserved` 字段
 - **架构重构（Phase 3/4）**：`TickAligner`（`data_engine/tick_aligner.py`）独立为市场状态容器，`PCPArbitrageStrategy`（`strategies/pcp_arbitrage.py`）改为无状态策略，接收 `MarketSnapshot` 作为输入；信号类型由 `TradeSignal` 升级为 `ArbitrageSignal`；期权 tick 数据类型由 `TickData` 更名为 `OptionTickData`（语义明确化）；`monitors/monitor.py` 与 `web/market_cache.py` 均已迁移至新架构
 - **models 包重组**：`models.py` 拆分为 `models/data.py`（市场数据类）和 `models/order.py`（信号/订单类），顶层 `models/__init__.py` 保持向后兼容，原有 `from models import ...` 语句无需修改
 - **回测引擎解耦**：`backtest/engine.py` 精简为编排层，撮合逻辑迁至 `backtest/portfolio.py`，数据流生成迁至 `backtest/data_feed.py`；`run()` 接口签名不变
