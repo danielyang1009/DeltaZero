@@ -369,6 +369,21 @@ return pcp_strategy.generate_signals(snapshot)  # 内部合并 OPEN + CLOSE，En
    - **调度层**：在 `backtest/engine.py` 中增加对新 Signal 类型的路由分派（基于 `isinstance` 判定，分发至对应的 Broker 方法）。
    - **账务层**：在 `backtest/portfolio.py` 的 `process_trades` 中，补充单边策略特有的保证金计算与释放逻辑（单边期权的保证金规则与 PCP 套利完全不同）。
 
+## 📝 README.md 维护规范 (面向人类阅读)
+
+`README.md` 的唯一受众是**人类所有者**，其核心目的是"提供全局视野和快速操作指南"，而不是"沉淀底层技术细节"。在更新 `README.md` 时，必须严格遵守以下原则：
+
+1. **极简主义与高信噪比**：
+   - **保留**：系统全局拓扑图（ASCII 架构图）、核心层级说明、日常启动流程（SOP）、关键 CLI 命令清单。
+   - **禁止**：严禁在 README 中堆砌代码级别的实现细节（如具体的 Parquet Schema 表格、长篇的底层 API 调用逻辑、复杂的数学公式推导）。
+2. **细节下沉到 docs/**：
+   - 凡是超过 200 字的技术原理解析（如 DDE 的 ADVISE 模式原理、Black-76 Brent 法求 IV 的推导等），**必须**移出 README，写入 `docs/` 目录下的专属 Markdown 文件中（如 `docs/dde_tech_spec.md`, `docs/vol_smile_math.md`），并在 README 中仅留一行超链接跳转。
+3. **变更日志（Changelog）的克制**：
+   - `README.md` 中的"最近变更"板块**最多只保留最近的 3 到 5 条核心架构/功能级更新**。
+   - 每次 commit 前同步改动时，必须是"高度概括的一句话总结"，绝不能把长篇大论的代码重构细节堆砌进去。历史陈旧的变更记录应定期清理或转移至独立的 `CHANGELOG.md`。
+4. **目录结构说明要"薄"**：
+   - 描述模块命名时，一句话说清模块职责即可，不要把类名、内部函数名全抄上去。
+
 ## 协作偏好（Claude 参考）
 
 - 用户倾向于**自己执行命令**，不喜欢 Claude 直接运行脚本（尤其涉及进程启停）

@@ -460,7 +460,7 @@ def init_strategy_and_contracts(
         contract_mgr, active, etf_prices, atm_range_pct
     )
     _log(
-        f"Call/Put 配对: {len(pairs)} 组  监控期权: {len(option_codes)} 个"
+        f"Call/Put 配对: {len(pairs)} 组  监控期权: {len(option_codes)} 个  标的 ETF: {len(etf_codes)} 个"
     )
 
     return strategy, contract_mgr, active, pairs, option_codes, etf_codes

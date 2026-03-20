@@ -22,8 +22,8 @@ h1{margin:0 0 12px;font-size:20px}
 .ul-header .toggle{font-size:11px;color:#94a3b8;min-width:12px}
 .ul-header .spot{color:#475569;font-weight:400}
 .ul-header .stats{color:#64748b;font-weight:400;margin-left:auto;font-size:12px;white-space:nowrap}
-.iv-inline{display:flex;flex-wrap:wrap;gap:6px}
-.iv-chip{font-size:11px;color:#1d4ed8;background:#eff6ff;border:1px solid #bfdbfe;border-radius:4px;padding:1px 6px;white-space:nowrap}
+.iv-inline{display:flex;flex-wrap:nowrap;gap:6px;overflow:hidden;flex-shrink:1;min-width:0}
+.iv-chip{font-size:11px;color:#1d4ed8;background:#eff6ff;border:1px solid #bfdbfe;border-radius:4px;padding:1px 6px;white-space:nowrap;flex-shrink:0}
 .ul-body.collapsed{display:none}
 
 /* ── 层级 2：到期日+合约类型 ── */
@@ -32,17 +32,18 @@ h1{margin:0 0 12px;font-size:20px}
 .grp-header{display:flex;align-items:center;gap:10px;padding:7px 16px;cursor:pointer;user-select:none;background:#f1f5f9;font-size:12px;font-weight:600;border-bottom:1px solid #e2e8f0}
 .grp-header:hover{background:#e8ecf3}
 .grp-header .toggle{font-size:10px;color:#94a3b8;min-width:10px}
-.grp-body{overflow-x:auto;padding:0 48px}
+.grp-body{overflow-x:auto;overflow-y:hidden;padding:0 48px}
 .grp-body.collapsed{display:none}
 
 table.sig-table{width:100%;border-collapse:collapse;font-size:12px;table-layout:fixed}
-table.sig-table th{background:none;padding:5px 8px;text-align:right;border-bottom:2px solid #e2e8f0;white-space:nowrap;font-weight:400;color:#1a1a2e}
+table.sig-table th{background:none;padding:5px 8px;text-align:right;border-bottom:2px solid #e2e8f0;white-space:nowrap;overflow:hidden;font-weight:400;color:#1a1a2e}
 table.sig-table th:first-child{text-align:left}
 table.sig-table th:nth-child(2){text-align:left}
-table.sig-table tr{height:26px}
-table.sig-table td{padding:0 8px;text-align:right;border-bottom:1px solid #f1f5f9;line-height:26px;white-space:nowrap}
+table.sig-table tr{height:26px;max-height:26px}
+table.sig-table td{padding:0 8px;text-align:right;border-bottom:1px solid #f1f5f9;line-height:26px;white-space:nowrap;overflow:hidden}
 table.sig-table td:first-child{text-align:left;font-weight:600}
 table.sig-table tbody td{color:#1a1a2e}
+tr.profit-pos{background:#f0fdf4}
 tr.profit-pos td.profit-cell{color:#16a34a}
 tr.profit-zero td.profit-cell{color:#1a1a2e}
 tr.profit-neg td.profit-cell{color:#cbd5e1}

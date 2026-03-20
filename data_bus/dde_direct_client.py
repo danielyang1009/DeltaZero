@@ -506,7 +506,7 @@ class _DDEClient:
             name="dde-direct-pump",
         )
         self._pump_thread.start()
-        logger.info("_DDEClient: 已启动，订阅 %d 个合约", len(codes))
+        logger.info("_DDEClient: 已启动，订阅 %d 个代码（期权+ETF）", len(codes))
 
     def stop(self) -> None:
         self._running = False
