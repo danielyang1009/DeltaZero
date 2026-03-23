@@ -2,6 +2,7 @@
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8"/>
+<link rel="icon" type="image/png" href="/static/favicon.png"/>
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
 <title>PCP 套利监控 — DeltaZero</title>
 <style>
@@ -240,9 +241,9 @@ function doRender(){
         // ── 层级 2 正文（表格）───────────────────────────────────
         html += `<div class="grp-body${grpColl ? " collapsed" : ""}">`;
         html += `<table class="sig-table"><thead><tr>`;
-        html += `<th style="width:68px">行权价</th><th style="width:44px">方向</th><th style="width:60px">净利润</th><th style="width:54px">Net_1T</th><th style="width:48px">TOL</th>`;
-        html += `<th style="width:56px">Max_Qty</th><th style="width:52px">SPRD</th><th style="width:52px">OBI_C</th><th style="width:52px">OBI_P</th><th style="width:52px">OBI_S</th>`;
-        html += `<th style="width:60px">C_bid</th><th style="width:60px">P_ask</th><th style="width:60px">S_ask</th>`;
+        html += `<th style="width:68px">行权价</th><th style="width:44px">方向</th><th style="width:60px">净利润</th><th style="width:54px">Net_1T</th><th style="width:56px">Max_Qty</th>`;
+        html += `<th style="width:48px">TOL</th><th style="width:52px">SPRD</th><th style="width:52px">OBI_S</th><th style="width:52px">OBI_C</th><th style="width:52px">OBI_P</th>`;
+        html += `<th style="width:60px">S_ask</th><th style="width:60px">C_bid</th><th style="width:60px">P_ask</th>`;
         html += `</tr></thead><tbody>`;
 
         for(const sig of g.rows){
@@ -257,15 +258,15 @@ function doRender(){
           html += `<td class="dir-cell">${dirStr}</td>`;
           html += `<td class="profit-cell">${fmt(sig.net_profit,0)}</td>`;
           html += `<td>${fmt(sig.net_1tick,0)}</td>`;
-          html += `<td>${fmt(sig.tolerance,2)}</td>`;
           html += `<td>${fmt(sig.max_qty,1)}</td>`;
+          html += `<td>${fmt(sig.tolerance,2)}</td>`;
           html += `<td>${sig.spread_ratio!=null?(sig.spread_ratio*100).toFixed(1)+"%":"—"}</td>`;
+          html += `<td>${fmt(sig.obi_s,3)}</td>`;
           html += `<td>${fmt(sig.obi_c,3)}</td>`;
           html += `<td>${fmt(sig.obi_p,3)}</td>`;
-          html += `<td>${fmt(sig.obi_s,3)}</td>`;
+          html += `<td>${fmt(sig.spot_ask,4)}</td>`;
           html += `<td>${fmt(sig.call_bid,4)}</td>`;
           html += `<td>${fmt(sig.put_ask,4)}</td>`;
-          html += `<td>${fmt(sig.spot_ask,4)}</td>`;
           html += `</tr>`;
         }
 

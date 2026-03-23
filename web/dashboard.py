@@ -19,6 +19,7 @@ import scipy.interpolate  # noqa: F401
 import scipy.stats  # noqa: F401
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from config.settings import DEFAULT_MARKET_DATA_DIR, DEFAULT_MIN_PROFIT, DEFAULT_EXPIRY_DAYS, DEFAULT_N_EACH_SIDE, DEFAULT_REFRESH_SECS
@@ -50,6 +51,7 @@ VOL_SMILE_TEMPLATE_PATH = Path(__file__).resolve().parent / "templates" / "vol_s
 MONITOR_TEMPLATE_PATH = Path(__file__).resolve().parent / "templates" / "monitor.html"
 
 app = FastAPI(title="DeltaZero Web Console", version="0.3.0")
+app.mount("/static", StaticFiles(directory=Path(__file__).resolve().parent / "static"), name="static")
 
 _ws_clients: set = set()
 _monitor_ws_clients: set = set()
