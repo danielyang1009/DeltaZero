@@ -17,15 +17,15 @@ from __future__ import annotations
 import logging
 import math
 import re
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 
-from models import OptionTickData, normalize_code
+from models import ETFTickData, OptionTickData, normalize_code
 
 logger = logging.getLogger(__name__)
 
@@ -206,7 +206,228 @@ class TickLoader:
         return result
 
     # ============================================================
-    # 内部工具方法
+    # Parquet 加载方法
+    # ============================================================
+
+    def load_option_parquet(self, filepath: str | Path) -> List[OptionTickData]:
+        """
+        加载 DataBus 落盘的期权 Parquet 文件并转换为 OptionTickData 列表。
+
+        列映射: ts(int64 ms)→timestamp, code→contract_code, last→current,
+        ask1/bid1→盘口一档, askv1/bidv1→一档量, oi→position, vol→volume,
+        high/low→高低价, 2-5 档填 nan/0, money=0.0
+
+        自动过滤 9:30 前的集合竞价数据。
+        """
+        filepath = Path(filepath)
+        if not filepath.exists():
+            raise FileNotFoundError(f"Parquet 文件不存在: {filepath}")
+
+        logger.debug("加载期权 Parquet: %s", filepath.name)
+
+        df = pd.read_parquet(filepath, engine="pyarrow")
+        if df.empty:
+            return []
+
+        # --- 过滤集合竞价数据 (9:30 前) ---
+        ts_arr = df["ts"].to_numpy(dtype=np.int64)
+        df = self._filter_pre_open(df, ts_arr)
+        if df.empty:
+            return []
+
+        # 重新取过滤后的数组
+        ts_arr = df["ts"].to_numpy(dtype=np.int64)
+        n = len(df)
+
+        # 向量化时间戳转换: int64 ms → datetime (本地时区)
+        timestamps = pd.to_datetime(ts_arr, unit="ms", utc=True).tz_convert("Asia/Shanghai").tz_localize(None).to_pydatetime().tolist()
+
+        codes = df["code"].tolist()
+        current_arr = df["last"].to_numpy(dtype=float)
+        ask1_arr = df["ask1"].to_numpy(dtype=float)
+        bid1_arr = df["bid1"].to_numpy(dtype=float)
+        askv1_arr = df["askv1"].to_numpy(dtype=np.int64)
+        bidv1_arr = df["bidv1"].to_numpy(dtype=np.int64)
+        oi_arr = df["oi"].to_numpy(dtype=np.int64) if "oi" in df.columns else np.zeros(n, dtype=np.int64)
+        vol_arr = df["vol"].to_numpy(dtype=np.int64) if "vol" in df.columns else np.zeros(n, dtype=np.int64)
+        high_arr = df["high"].to_numpy(dtype=float) if "high" in df.columns else np.full(n, math.nan)
+        low_arr = df["low"].to_numpy(dtype=float) if "low" in df.columns else np.full(n, math.nan)
+
+        nan5 = [math.nan] * 4
+        zero4 = [0] * 4
+
+        ticks: List[OptionTickData] = []
+        for i in range(n):
+            ticks.append(OptionTickData(
+                timestamp=timestamps[i],
+                contract_code=codes[i],
+                current=float(current_arr[i]),
+                volume=int(vol_arr[i]),
+                high=float(high_arr[i]),
+                low=float(low_arr[i]),
+                money=0.0,
+                position=int(oi_arr[i]),
+                ask_prices=[float(ask1_arr[i])] + nan5,
+                ask_volumes=[int(askv1_arr[i])] + zero4,
+                bid_prices=[float(bid1_arr[i])] + nan5,
+                bid_volumes=[int(bidv1_arr[i])] + zero4,
+            ))
+
+        ticks.sort(key=lambda t: t.timestamp)
+        logger.debug("  期权 Parquet 加载完毕: %d 条 (过滤集合竞价后)", len(ticks))
+        return ticks
+
+    def load_etf_parquet(self, filepath: str | Path) -> List[ETFTickData]:
+        """
+        加载 DataBus 落盘的 ETF Parquet 文件并转换为 ETFTickData 列表。
+
+        列映射: ts→timestamp, code→etf_code, last→price,
+        ask1/bid1→ask_price/bid_price, askv1/bidv1→ask_volume/bid_volume
+
+        自动过滤 9:30 前的集合竞价数据。
+        """
+        filepath = Path(filepath)
+        if not filepath.exists():
+            raise FileNotFoundError(f"Parquet 文件不存在: {filepath}")
+
+        logger.debug("加载 ETF Parquet: %s", filepath.name)
+
+        df = pd.read_parquet(filepath, engine="pyarrow")
+        if df.empty:
+            return []
+
+        # --- 过滤集合竞价数据 (9:30 前) ---
+        ts_arr = df["ts"].to_numpy(dtype=np.int64)
+        df = self._filter_pre_open(df, ts_arr)
+        if df.empty:
+            return []
+
+        ts_arr = df["ts"].to_numpy(dtype=np.int64)
+        n = len(df)
+
+        timestamps = pd.to_datetime(ts_arr, unit="ms", utc=True).tz_convert("Asia/Shanghai").tz_localize(None).to_pydatetime().tolist()
+
+        codes = df["code"].tolist()
+        price_arr = df["last"].to_numpy(dtype=float)
+        ask1_arr = df["ask1"].to_numpy(dtype=float)
+        bid1_arr = df["bid1"].to_numpy(dtype=float)
+        askv1_arr = df["askv1"].to_numpy(dtype=np.int64) if "askv1" in df.columns else np.zeros(n, dtype=np.int64)
+        bidv1_arr = df["bidv1"].to_numpy(dtype=np.int64) if "bidv1" in df.columns else np.zeros(n, dtype=np.int64)
+
+        ticks: List[ETFTickData] = []
+        for i in range(n):
+            ticks.append(ETFTickData(
+                timestamp=timestamps[i],
+                etf_code=codes[i],
+                price=float(price_arr[i]),
+                ask_price=float(ask1_arr[i]),
+                bid_price=float(bid1_arr[i]),
+                ask_volume=int(askv1_arr[i]),
+                bid_volume=int(bidv1_arr[i]),
+                is_simulated=False,
+            ))
+
+        ticks.sort(key=lambda t: t.timestamp)
+        logger.debug("  ETF Parquet 加载完毕: %d 条 (过滤集合竞价后)", len(ticks))
+        return ticks
+
+    def load_market_data_dir(
+        self,
+        root: str | Path,
+        underlyings: List[str],
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+    ) -> Tuple[Dict[str, List[OptionTickData]], List[ETFTickData], List[date]]:
+        """
+        从 MARKET_DATA 目录加载多品种多日 Parquet 数据。
+
+        目录结构: {root}/{underlying_去掉.SH}/options_YYYYMMDD.parquet
+                  {root}/{underlying_去掉.SH}/etf_YYYYMMDD.parquet
+
+        Args:
+            root: 数据根目录 (如 D:\\MARKET_DATA)
+            underlyings: 品种列表 (如 ["510050.SH", "510300.SH"])
+            start_date: 起始日期 YYYYMMDD (含)
+            end_date: 结束日期 YYYYMMDD (含)
+
+        Returns:
+            (option_ticks_by_code, all_etf_ticks, sorted_trading_dates)
+        """
+        root = Path(root)
+        option_ticks: Dict[str, List[OptionTickData]] = {}
+        all_etf_ticks: List[ETFTickData] = []
+        date_set: set[date] = set()
+        _date_re = re.compile(r"(\d{8})")
+
+        for underlying in underlyings:
+            ul_dir = root / underlying.replace(".SH", "")
+            if not ul_dir.is_dir():
+                logger.warning("品种目录不存在: %s", ul_dir)
+                continue
+
+            opt_files = sorted(ul_dir.glob("options_*.parquet"))
+            etf_files = sorted(ul_dir.glob("etf_*.parquet"))
+
+            for fpath in opt_files:
+                m = _date_re.search(fpath.stem)
+                if not m:
+                    continue
+                fdate = m.group(1)
+                if start_date and fdate < start_date:
+                    continue
+                if end_date and fdate > end_date:
+                    continue
+
+                trade_date = date(int(fdate[:4]), int(fdate[4:6]), int(fdate[6:8]))
+                date_set.add(trade_date)
+
+                logger.info("加载期权: %s", fpath.name)
+                ticks = self.load_option_parquet(fpath)
+                for tick in ticks:
+                    option_ticks.setdefault(tick.contract_code, []).append(tick)
+
+            for fpath in etf_files:
+                m = _date_re.search(fpath.stem)
+                if not m:
+                    continue
+                fdate = m.group(1)
+                if start_date and fdate < start_date:
+                    continue
+                if end_date and fdate > end_date:
+                    continue
+
+                logger.info("加载 ETF: %s", fpath.name)
+                ticks = self.load_etf_parquet(fpath)
+                all_etf_ticks.extend(ticks)
+
+        # 按时间排序
+        for code in option_ticks:
+            option_ticks[code].sort(key=lambda t: t.timestamp)
+        all_etf_ticks.sort(key=lambda t: t.timestamp)
+
+        sorted_dates = sorted(date_set)
+        total_opt = sum(len(v) for v in option_ticks.values())
+        logger.info(
+            "Parquet 加载完毕: %d 个品种, %d 个交易日, %d 个期权合约 (%d 条), %d 条 ETF",
+            len(underlyings), len(sorted_dates), len(option_ticks), total_opt, len(all_etf_ticks),
+        )
+        return option_ticks, all_etf_ticks, sorted_dates
+
+    @staticmethod
+    def _filter_pre_open(df: pd.DataFrame, ts_arr: np.ndarray) -> pd.DataFrame:
+        """过滤 9:30 前的集合竞价数据（基于 Unix ms 时间戳整数比较）。"""
+        if len(ts_arr) == 0:
+            return df
+        # 从第一个 ts 推算当日日期 (CST = UTC+8)
+        sample_dt = datetime.fromtimestamp(int(ts_arr[0]) / 1000)  # 本地时区（CST）
+        # 当日 9:30:00 CST 的 Unix 时间戳
+        open_dt = datetime(sample_dt.year, sample_dt.month, sample_dt.day, 9, 30, 0)
+        open_ms = int(open_dt.timestamp() * 1000)
+        mask = ts_arr >= open_ms
+        return df[mask].copy()
+
+    # ============================================================
+    # 内部工具方法（CSV）
     # ============================================================
 
     @staticmethod

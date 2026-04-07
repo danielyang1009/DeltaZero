@@ -110,6 +110,11 @@ class TradingConfig:
     min_volume_threshold: int = 10                 # 最小成交量过滤
     enable_reverse: bool = False                   # 是否输出反向套利信号（融券卖出，未计息成本，默认关闭）
 
+    # 信号雪崩防护
+    signal_cooldown_seconds: float = 1.0           # 开仓冷却时间（秒），同冷却期内只开第一组；0=不限
+    max_total_open_sets: int = 0                   # 全局最大持仓组数（0=不限）
+    min_dte_for_open: int = 0                      # 开仓最小剩余天数（0=不限；建议3，避免末日轮开仓）
+
     # PCP 套利成本参数（实时监控简化公式，见 pcp_arbitrage.py 说明）
     etf_fee_rate: float = 0.00020                  # ETF 现货单边规费（含佣金+过户费，约万2）
     option_round_trip_fee: float = 3.0             # 期权双边固定手续费（≈ fee.option_commission_per_contract × 2 取整）

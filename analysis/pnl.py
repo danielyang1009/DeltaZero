@@ -38,7 +38,7 @@ class PerformanceMetrics:
     max_drawdown: float             # 最大回撤（金额）
     max_drawdown_pct: float         # 最大回撤（百分比）
     win_rate: float                 # 胜率
-    profit_loss_ratio: float        # 盈亏比
+    profit_loss_ratio: Optional[float]  # 盈亏比（无亏损时为 None，表示 ∞）
     sharpe_ratio: float             # 夏普比率
     total_trades: int               # 总交易笔数
     total_signals: int              # 总信号数
@@ -52,10 +52,12 @@ class SignalPnLResult:
     """单个信号的标准化结算结果（多态 PnL 统计的 DTO）"""
     signal_id:     str    # 信号序号（str 形式，兼容未来非整数 ID）
     signal_type:   str    # 信号类型名，如 "Arbitrage" / "Directional"
+    signal_action: str    # "OPEN" / "CLOSE"
     gross_pnl:     float  # 毛利润（不含手续费和滑点）
     net_pnl:       float  # 净利润（含手续费和滑点）
     slippage_cost: float  # 总滑点摩擦
     commission:    float  # 总手续费
+    has_trades:    bool = False  # 是否实际成交（未成交信号 net_pnl=0.0 但不计入胜率）
 
 
 class PnLAnalyzer:
@@ -119,15 +121,25 @@ class PnLAnalyzer:
         max_dd, max_dd_pct = self._calc_max_drawdown(equities)
 
         signal_results = self._dispatch_signal_pnls(signals, trade_history)
-        signal_pnls    = [r.net_pnl for r in signal_results]
-        win_rate = self._calc_win_rate(signal_pnls)
-        pl_ratio = self._calc_profit_loss_ratio(signal_pnls)
+        # 胜率/盈亏比只基于「已成交的 CLOSE 信号」（已实现盈亏）。
+        # 原因1：OPEN 信号的 net_pnl 为大负数（包含 ETF 本金支出），混入会严重失真。
+        # 原因2：策略每 tick 对所有配对生成 CLOSE 信号，绝大多数未成交（net_pnl=0.0）；
+        #        若不过滤，分母 = 数百万，胜率 ≈ 0%（已知 Bug）。
+        close_pnls = [r.net_pnl for r in signal_results
+                      if r.signal_action == "CLOSE" and r.has_trades]
+        eval_pnls  = close_pnls if close_pnls else [
+            r.net_pnl for r in signal_results if r.has_trades
+        ]
+        win_rate = self._calc_win_rate(eval_pnls)
+        pl_ratio = self._calc_profit_loss_ratio(eval_pnls)
 
         daily_returns = self._calc_daily_returns(equity_curve)
         sharpe = self._calc_sharpe_ratio(daily_returns)
 
         total_commission = sum(t.commission for t in trade_history)
-        avg_profit = total_pnl / len(signals) if signals else 0.0
+        # 已执行信号数（has_trades=True）：与信号明细表行数一致，避免与总生成信号数混淆
+        executed_count = sum(1 for r in signal_results if r.has_trades)
+        avg_profit = total_pnl / executed_count if executed_count > 0 else 0.0
 
         return PerformanceMetrics(
             total_pnl=round(total_pnl, 2),
@@ -136,10 +148,10 @@ class PnLAnalyzer:
             max_drawdown=round(max_dd, 2),
             max_drawdown_pct=round(max_dd_pct, 4),
             win_rate=round(win_rate, 4),
-            profit_loss_ratio=round(pl_ratio, 2),
+            profit_loss_ratio=round(pl_ratio, 2) if pl_ratio is not None else None,
             sharpe_ratio=round(sharpe, 2),
             total_trades=len(trade_history),
-            total_signals=len(signals),
+            total_signals=executed_count,
             total_commission=round(total_commission, 2),
             avg_profit_per_signal=round(avg_profit, 2),
             trading_days=trading_days,
@@ -220,7 +232,7 @@ class PnLAnalyzer:
             ["年化收益率", f"{metrics.annualized_return:.2%}"],
             ["最大回撤", f"{metrics.max_drawdown:,.2f} 元 ({metrics.max_drawdown_pct:.2%})"],
             ["胜率", f"{metrics.win_rate:.2%}"],
-            ["盈亏比", f"{metrics.profit_loss_ratio:.2f}"],
+            ["盈亏比", f"{metrics.profit_loss_ratio:.2f}" if metrics.profit_loss_ratio is not None else "∞（无亏损）"],
             ["夏普比率", f"{metrics.sharpe_ratio:.2f}"],
             ["总信号数", f"{metrics.total_signals}"],
             ["总成交笔数", f"{metrics.total_trades}"],
@@ -350,11 +362,28 @@ class PnLAnalyzer:
             if t.signal_id is not None:
                 trades_by_signal.setdefault(t.signal_id, []).append(t)
 
+        # 预建 executed OPEN 信号的 (call_code, put_code) → [idx] 映射。
+        # CLOSE 信号的往返净利润需要回溯同配对的 OPEN 成本（按平仓比例分摊）。
+        _open_by_pair: Dict[tuple, List[int]] = {}
+        for i, signal in enumerate(signals):
+            if not isinstance(signal, ArbitrageSignal):
+                continue
+            if i not in trades_by_signal:
+                continue
+            a = signal.action.value if hasattr(signal.action, "value") else str(signal.action)
+            if a == "OPEN":
+                pair = (signal.call_code, signal.put_code)
+                _open_by_pair.setdefault(pair, []).append(i)
+
         results: List[SignalPnLResult] = []
         for i, signal in enumerate(signals):
             legs = trades_by_signal.get(i, [])
             if isinstance(signal, ArbitrageSignal):
-                res = self._process_arbitrage(signal, i, legs)
+                res = self._process_arbitrage(
+                    signal, i, legs,
+                    open_by_pair=_open_by_pair,
+                    trades_by_signal=trades_by_signal,
+                )
             elif isinstance(signal, DirectionalSignal):
                 res = self._process_directional(signal, i, legs)
             else:
@@ -369,23 +398,78 @@ class PnLAnalyzer:
         signal: ArbitrageSignal,
         idx: int,
         legs: List[TradeRecord],
+        open_by_pair: Optional[Dict[tuple, List[int]]] = None,
+        trades_by_signal: Optional[Dict[int, List[TradeRecord]]] = None,
     ) -> Optional[SignalPnLResult]:
+        action = signal.action.value if hasattr(signal.action, "value") else str(signal.action)
         if not legs:
             # 无成交记录 = 信号被拒单或未执行，实际盈亏必须为 0
             # ⚠️ 绝不能返回 signal.net_profit，否则产生未成交的"利润幻觉"
             return SignalPnLResult(
                 signal_id=str(idx),
                 signal_type="Arbitrage",
+                signal_action=action,
                 gross_pnl=0.0,
                 net_pnl=0.0,
                 slippage_cost=0.0,
                 commission=0.0,
             )
+
+        # ── CLOSE 信号：计算往返净利润（与对应 OPEN 配对，按平仓比例分摊 OPEN 成本）──
+        # 直接用平仓腿 cash_flow 会包含 ETF 本金回收（~30000 元），导致结果虚高。
+        # 正确做法：ratio × OPEN_cash_flow + CLOSE_cash_flow，与 backtest_service._roundtrip_pnl 一致。
+        if action == "CLOSE" and open_by_pair is not None and trades_by_signal is not None:
+            pair   = (getattr(signal, "call_code", ""), getattr(signal, "put_code", ""))
+            priors = [j for j in open_by_pair.get(pair, []) if j < idx]
+            if priors:
+                def _opt_buy_qty(tlist: List[TradeRecord]) -> int:
+                    """期权 BUY 方向数量 = 本次成交组数"""
+                    return next(
+                        (t.quantity for t in tlist
+                         if t.asset_type == AssetType.OPTION and t.direction == 1),
+                        0,
+                    ) or 0
+
+                open_sets  = sum(_opt_buy_qty(trades_by_signal.get(j, [])) for j in priors)
+                close_sets = _opt_buy_qty(legs)
+                if open_sets > 0 and close_sets > 0:
+                    ratio = close_sets / open_sets
+                    open_trades = [t for j in priors for t in trades_by_signal.get(j, [])]
+
+                    def _cf(tlist: List[TradeRecord]) -> float:
+                        return sum(
+                            t.price * t.quantity * t.multiplier *
+                            (1 if t.side == OrderSide.BUY else -1)
+                            for t in tlist
+                        )
+
+                    open_cf   = _cf(open_trades)
+                    open_fee  = sum(t.commission for t in open_trades)
+                    close_cf  = _cf(legs)
+                    close_fee = sum(t.commission for t in legs)
+
+                    # ⚠️ 滑点已嵌入执行价格（price = 盘口价 ± 滑点），不可再次相加
+                    total_cf  = ratio * open_cf + close_cf
+                    total_fee = ratio * open_fee + close_fee
+                    net_pnl   = round(-(total_cf + total_fee), 2)
+                    gross_pnl = round(-total_cf, 2)
+
+                    return SignalPnLResult(
+                        signal_id=str(idx),
+                        signal_type="Arbitrage",
+                        signal_action=action,
+                        gross_pnl=gross_pnl,
+                        net_pnl=net_pnl,
+                        slippage_cost=sum(t.slippage_cost for t in legs),
+                        commission=total_fee,
+                        has_trades=True,
+                    )
+
+        # ── OPEN 信号（或找不到对应 OPEN 的 CLOSE 信号）：单腿现金流 ──
+        # 注意：此路径下 CLOSE 信号的 net_pnl 包含 ETF 本金回收，仅作为兜底，
+        # 不用于胜率统计（analyze 中已通过 has_trades + "CLOSE" 双重过滤）。
         commission    = sum(t.commission    for t in legs)
         slippage_cost = sum(t.slippage_cost for t in legs)
-        # ⚠️ 必须乘以 t.multiplier 还原真实资金流水：
-        #   ETF 腿：multiplier=1，quantity=num_sets*unit，两者之积即总股数，正确
-        #   期权腿：multiplier=unit(10000)，quantity=num_sets，两者之积还原名义价值
         cash_flow = sum(
             t.price * t.quantity * t.multiplier * (1 if t.side == OrderSide.BUY else -1)
             for t in legs
@@ -395,10 +479,12 @@ class PnLAnalyzer:
         return SignalPnLResult(
             signal_id=str(idx),
             signal_type="Arbitrage",
+            signal_action=action,
             gross_pnl=gross_pnl,
             net_pnl=net_pnl,
             slippage_cost=slippage_cost,
             commission=commission,
+            has_trades=True,
         )
 
     def _process_directional(
@@ -419,13 +505,19 @@ class PnLAnalyzer:
         return wins / len(pnls)
 
     @staticmethod
-    def _calc_profit_loss_ratio(pnls: List[float]) -> float:
-        """计算盈亏比（平均盈利 / 平均亏损）"""
+    def _calc_profit_loss_ratio(pnls: List[float]) -> Optional[float]:
+        """
+        计算盈亏比（平均盈利 / 平均亏损）。
+        无任何盈利或无任何亏损时返回 None（而非 0.0），由调用方按语义处理：
+          - profits > 0, losses = 0 → ∞（历史全胜，无亏损参考点）
+          - profits = 0, losses > 0 → 无胜利，盈亏比无意义
+          - both empty                → 无数据
+        """
         profits = [p for p in pnls if p > 0]
-        losses = [abs(p) for p in pnls if p < 0]
+        losses  = [abs(p) for p in pnls if p < 0]
 
         if not profits or not losses:
-            return 0.0
+            return None
 
         return (sum(profits) / len(profits)) / (sum(losses) / len(losses))
 
@@ -492,7 +584,7 @@ class PnLAnalyzer:
         return PerformanceMetrics(
             total_pnl=0, total_return=0, annualized_return=0,
             max_drawdown=0, max_drawdown_pct=0, win_rate=0,
-            profit_loss_ratio=0, sharpe_ratio=0, total_trades=0,
+            profit_loss_ratio=None, sharpe_ratio=0, total_trades=0,
             total_signals=0, total_commission=0,
             avg_profit_per_signal=0, trading_days=0,
         )

@@ -1,0 +1,970 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>DeltaZero — PCP 回测</title>
+<link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+<style>
+  :root {
+    --bg: #f8f9fb; --card: #fff; --border: #e5e7eb;
+    --text: #1a1a2e; --text2: #6b7280; --text3: #9ca3af;
+    --primary: #2563eb; --primary-light: #dbeafe;
+    --success: #059669; --success-light: #d1fae5;
+    --danger: #dc2626; --danger-light: #fee2e2;
+    --warn: #d97706; --warn-light: #fef3c7;
+    --radius: 8px; --shadow: 0 1px 3px rgba(0,0,0,.08);
+  }
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { font-family:'Segoe UI',system-ui,sans-serif; background:var(--bg); color:var(--text); font-size:14px; line-height:1.6; }
+
+  .topbar { background:#1a1a2e; color:#fff; padding:10px 24px; display:flex; align-items:center; gap:16px; }
+  .topbar h1 { font-size:16px; font-weight:600; }
+  .topbar a { color:#93c5fd; text-decoration:none; font-size:13px; }
+  .topbar a:hover { text-decoration:underline; }
+
+  .container { max-width:1400px; margin:0 auto; padding:16px 24px; }
+
+  .card { background:var(--card); border:1px solid var(--border); border-radius:var(--radius); box-shadow:var(--shadow); padding:16px 20px; margin-bottom:16px; }
+  .card h2 { font-size:14px; font-weight:600; margin-bottom:12px; color:var(--text2); text-transform:uppercase; letter-spacing:.5px; }
+
+  .form-row { display:flex; flex-wrap:wrap; gap:12px; align-items:flex-end; margin-bottom:12px; }
+  .form-group { display:flex; flex-direction:column; gap:4px; }
+  .form-group label { font-size:12px; color:var(--text2); font-weight:500; }
+  .form-group input, .form-group select { padding:6px 10px; border:1px solid var(--border); border-radius:4px; font-size:13px; width:140px; }
+  .form-group input:focus { outline:none; border-color:var(--primary); box-shadow:0 0 0 2px var(--primary-light); }
+
+  .checkbox-group { display:flex; gap:12px; align-items:center; }
+  .checkbox-group label { font-size:13px; cursor:pointer; display:flex; align-items:center; gap:4px; }
+  .checkbox-group input[type=checkbox] { width:16px; height:16px; }
+
+  .btn { padding:8px 20px; border:none; border-radius:4px; font-size:13px; font-weight:500; cursor:pointer; transition:background .15s; }
+  .btn-primary { background:var(--primary); color:#fff; }
+  .btn-primary:hover { background:#1d4ed8; }
+  .btn-primary:disabled { background:var(--text3); cursor:not-allowed; }
+  .btn-danger { background:var(--danger); color:#fff; }
+  .btn-danger:hover { background:#b91c1c; }
+  .btn-danger:disabled { background:var(--text3); cursor:not-allowed; }
+  .btn-small { padding:3px 10px; border:1px solid var(--border); border-radius:4px; background:var(--card); color:var(--text2); font-size:11px; cursor:pointer; }
+  .btn-small:hover { background:var(--border); color:var(--text1); }
+
+  /* Progress */
+  .progress-section { display:none; }
+  .progress-bar-outer { background:#e5e7eb; border-radius:4px; height:24px; overflow:hidden; position:relative; }
+  .progress-bar-inner { background:var(--primary); height:100%; transition:width .3s; min-width:0; border-radius:4px; }
+  .progress-bar-text { position:absolute; top:0; left:0; right:0; height:100%; display:flex; align-items:center; justify-content:center; font-size:12px; font-weight:500; color:var(--text); }
+  .progress-info { font-size:12px; color:var(--text2); margin-top:6px; }
+
+  /* Metrics cards */
+  .metrics-grid { display:grid; grid-template-columns:repeat(auto-fill, minmax(160px,1fr)); gap:10px; }
+  .metric-card { background:var(--bg); border:1px solid var(--border); border-radius:6px; padding:10px 12px; text-align:center; }
+  .metric-card .val { font-size:20px; font-weight:700; }
+  .metric-card .label { font-size:11px; color:var(--text2); margin-top:2px; }
+  .metric-card .val.positive { color:var(--success); }
+  .metric-card .val.negative { color:var(--danger); }
+
+  /* Chart */
+  #equity-chart { width:100%; height:320px; }
+
+  /* Tables */
+  .table-wrap { overflow-x:auto; max-height:500px; overflow-y:auto; }
+  table { width:100%; border-collapse:collapse; font-size:12px; }
+  th { background:var(--bg); position:sticky; top:0; z-index:1; padding:6px 8px; text-align:left; font-weight:600; border-bottom:2px solid var(--border); cursor:pointer; white-space:nowrap; }
+  th:hover { background:#e5e7eb; }
+  td { padding:5px 8px; border-bottom:1px solid var(--border); white-space:nowrap; }
+  tr:hover td { background:#f3f4f6; }
+  .text-right { text-align:right; }
+  .text-center { text-align:center; }
+  .positive { color:var(--success); }
+  .negative { color:var(--danger); }
+
+  /* Results section */
+  .results-section { display:none; }
+
+  /* Tab nav */
+  .tab-nav { display:flex; gap:0; border-bottom:2px solid var(--border); margin-bottom:12px; }
+  .tab-btn { padding:8px 16px; border:none; background:none; font-size:13px; cursor:pointer; color:var(--text2); border-bottom:2px solid transparent; margin-bottom:-2px; }
+  .tab-btn.active { color:var(--primary); border-bottom-color:var(--primary); font-weight:600; }
+  .tab-content { display:none; }
+  .tab-content.active { display:block; }
+
+  .error-msg { background:var(--danger-light); color:var(--danger); padding:10px 14px; border-radius:6px; font-size:13px; display:none; }
+
+  /* 参数分区 */
+  .param-section { margin-bottom:14px; padding-bottom:12px; border-bottom:1px solid var(--border); }
+  .param-section:last-of-type { border-bottom:none; margin-bottom:0; }
+  .param-section-title { font-size:12px; font-weight:600; color:var(--text2); text-transform:uppercase; letter-spacing:.4px; margin-bottom:8px; }
+  .details-summary { cursor:pointer; font-size:12px; color:var(--text2); font-weight:600; user-select:none; padding:4px 0; }
+</style>
+</head>
+<body>
+
+<div class="topbar">
+  <h1>DeltaZero — PCP 套利回测</h1>
+  <a href="/">主控台</a>
+  <a href="/monitor">监控</a>
+  <a href="/vol_smile">Vol Smile</a>
+</div>
+
+<div class="container">
+
+<!-- 参数面板 -->
+<div class="card">
+  <h2>回测参数</h2>
+
+  <!-- ① 基础参数 -->
+  <div class="param-section">
+    <div class="param-section-title">基础参数</div>
+    <div class="form-row">
+      <div class="form-group">
+        <label>品种</label>
+        <div class="checkbox-group" id="ul-checks">
+          <label><input type="checkbox" value="510050.SH" checked> 50ETF</label>
+          <label><input type="checkbox" value="510300.SH"> 300ETF</label>
+          <label><input type="checkbox" value="510500.SH"> 500ETF</label>
+        </div>
+      </div>
+      <div class="form-group">
+        <label>起始日期</label>
+        <input type="text" id="start-date" placeholder="YYYYMMDD" value="">
+      </div>
+      <div class="form-group">
+        <label>结束日期</label>
+        <input type="text" id="end-date" placeholder="YYYYMMDD" value="">
+      </div>
+      <div class="form-group">
+        <label>初始资金 (元)</label>
+        <input type="number" id="initial-capital" value="1000000" step="100000">
+      </div>
+      <div class="form-group">
+        <label>信号生成模式</label>
+        <select id="signal-mode" style="width:160px" title="ETF tick 模式速度快约100x">
+          <option value="etf_tick">ETF tick（快速，推荐）</option>
+          <option value="every_tick">每 tick（精确，慢）</option>
+        </select>
+      </div>
+    </div>
+  </div>
+
+  <!-- ② 开仓条件 -->
+  <div class="param-section">
+    <div class="param-section-title">开仓条件</div>
+    <div class="form-row">
+      <div class="form-group">
+        <label>最小净利润 (元/组)</label>
+        <input type="number" id="min-profit" value="50" step="10" title="PCP 套利净利润 ≥ 此值才触发开仓信号">
+      </div>
+      <div class="form-group">
+        <label>单信号最大组数</label>
+        <input type="number" id="max-pos" value="10" step="1" title="每个信号最多执行的套利组数（资金允许范围内）">
+      </div>
+      <div class="form-group">
+        <label>容错空间下限 (tick)</label>
+        <input type="number" id="min-tolerance" value="0" step="0.5" min="0"
+          title="信号可承受的最小 tick 数（净利润/单tick损失）。建议≥2，防止一档滑点即亏损。0=不过滤">
+      </div>
+      <div class="form-group">
+        <label>最大价差率上限 (%)</label>
+        <input type="number" id="max-spread-ratio" value="0" step="0.1" min="0"
+          title="Call/Put/ETF 三腿最大买卖价差率（相对于mid价），超过此值拒绝开仓。如填 2 = 2%。0=不过滤">
+      </div>
+      <div class="form-group">
+        <label>盘口容量下限 (组)</label>
+        <input type="number" id="min-max-qty" value="0" step="1" min="0"
+          title="盘口可承接的最小组数，低于此值拒绝开仓。0=不过滤">
+      </div>
+    </div>
+  </div>
+
+  <!-- ③ 平仓条件 -->
+  <div class="param-section">
+    <div class="param-section-title">平仓条件</div>
+    <div class="form-row">
+      <div class="form-group">
+        <label>平仓净利润下限 (元/组)</label>
+        <input type="number" id="close-profit" value="-100" step="10"
+          title="平仓净利润 ≥ 此值时策略才会发出平仓信号。负值=接受摩擦损耗，如 -100 表示亏损不超过100元也平。0=收支平衡才平">
+      </div>
+      <div class="form-group">
+        <label>临期规避平仓 (DTE天)</label>
+        <input type="number" id="close-dte" value="0" step="1" min="0"
+          title="距到期日剩余天数 ≤ 此值时强制平仓，规避到期风险。0=不启用">
+      </div>
+      <div class="form-group">
+        <label>止损阈值 (元/组)</label>
+        <input type="number" id="stop-loss" value="0" step="10" min="0"
+          title="当前平仓会产生的净亏损 ≥ 此值时强制止损。0=不启用">
+      </div>
+    </div>
+    <div class="form-row" style="margin-top:6px">
+      <div class="form-group" style="flex:1">
+        <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
+          <input type="checkbox" id="close-next-open" style="width:14px;height:14px">
+          <span>次日开盘强制平仓</span>
+        </label>
+        <div style="font-size:11px;color:#888;margin-top:3px">
+          T+1 约束下的日内策略：今日开仓，次日开盘首个有效报价时无条件平仓。建议同时将平仓净利润下限设为负值（如 -200）以确保信号触发。
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ④ 交易设定（折叠） -->
+  <details style="margin-top:4px">
+    <summary class="details-summary">▸ 交易设定（手续费 / 滑点 / 保证金 / 防护）</summary>
+    <div style="padding:10px 0 4px 0">
+      <div style="font-size:12px;color:var(--text2);font-weight:600;margin-bottom:6px">成本参数</div>
+      <div class="form-row">
+        <div class="form-group">
+          <label>期权手续费 (元/张)</label>
+          <input type="number" id="opt-commission" value="1.7" step="0.1" min="0">
+        </div>
+        <div class="form-group">
+          <label>ETF 佣金率（万分之）</label>
+          <input type="number" id="etf-commission-rate" value="0.6" step="0.1" min="0"
+            title="ETF 交易佣金费率，单位：万分之。如填 0.6 = 万分之0.6 = 0.006%">
+        </div>
+        <div class="form-group">
+          <label>ETF 最低佣金 (元)</label>
+          <input type="number" id="etf-min-commission" value="0.1" step="0.1" min="0">
+        </div>
+        <div class="form-group">
+          <label>期权滑点 (tick)</label>
+          <input type="number" id="opt-slippage" value="1" step="1" min="0" title="1 tick = 0.0001元">
+        </div>
+        <div class="form-group">
+          <label>ETF 滑点 (tick)</label>
+          <input type="number" id="etf-slippage" value="1" step="1" min="0" title="1 tick = 0.001元">
+        </div>
+        <div class="form-group">
+          <label>认购保证金比例 (%)</label>
+          <input type="number" id="call-margin" value="12" step="1" min="1" max="100"
+            title="上交所认购期权保证金比例。如填 12 = 12%（上交所默认标准）">
+        </div>
+        <div class="form-group">
+          <label>认沽保证金比例 (%)</label>
+          <input type="number" id="put-margin" value="12" step="1" min="1" max="100"
+            title="上交所认沽期权保证金比例。如填 12 = 12%（上交所默认标准）">
+        </div>
+      </div>
+      <div style="margin-top:8px;padding-top:8px;border-top:1px solid var(--border)">
+        <div style="font-size:12px;color:var(--text2);font-weight:600;margin-bottom:6px">信号雪崩防护</div>
+        <div class="form-row">
+          <div class="form-group">
+            <label>开仓冷却 (秒)</label>
+            <input type="number" id="cooldown-secs" value="1" step="0.5" min="0"
+              title="两次开仓之间的最小间隔。0=不限">
+          </div>
+          <div class="form-group">
+            <label>全局最大持仓组数</label>
+            <input type="number" id="max-total-sets" value="0" step="5" min="0"
+              title="全局持仓上限，0=不限（建议50~100）">
+          </div>
+        </div>
+        <div class="form-row">
+          <div class="form-group">
+            <label>开仓最小剩余天数</label>
+            <input type="number" id="min-dte-open" value="0" step="1" min="0"
+              title="仅在合约剩余天数 ≥ 此值时才允许开仓，0=不限（建议 3，避免末日轮开仓）">
+          </div>
+        </div>
+      </div>
+    </div>
+  </details>
+
+  <div style="display:flex;align-items:center;justify-content:space-between;margin-top:10px">
+    <div id="available-dates" style="font-size:12px;color:var(--text3)"></div>
+    <div style="display:flex;gap:8px;align-items:center">
+      <button class="btn-small" id="btn-restore" onclick="restoreLastParams()"
+        style="display:none;padding:5px 12px;font-size:12px;border-color:#93c5fd;color:#2563eb"
+        title="恢复上次回测使用的参数设置">↺ 复用上次设置</button>
+      <button class="btn-small" id="btn-set-default" onclick="setAsDefault()"
+        style="padding:5px 12px;font-size:12px;border-color:#86efac;color:#16a34a"
+        title="将当前所有参数保存为默认值，下次打开页面自动加载">★ 设为默认</button>
+      <button class="btn btn-primary" id="btn-run" onclick="toggleBacktest()">启动回测</button>
+    </div>
+  </div>
+</div>
+
+<!-- Error -->
+<div class="error-msg" id="error-msg"></div>
+
+<!-- Progress -->
+<div class="card progress-section" id="progress-section">
+  <h2>回测进度 <span id="elapsed-badge" style="font-size:12px;font-weight:400;color:var(--text2);margin-left:8px"></span></h2>
+  <div style="font-size:13px;font-weight:500;margin-bottom:6px" id="progress-text">等待启动...</div>
+  <div class="progress-bar-outer" style="margin-bottom:6px">
+    <div class="progress-bar-inner" id="progress-bar" style="width:0%"></div>
+    <div class="progress-bar-text" id="progress-bar-label"></div>
+  </div>
+  <div class="progress-bar-outer" style="height:10px;margin-bottom:6px" title="当日 tick 进度">
+    <div class="progress-bar-inner" id="progress-bar-day" style="width:0%;background:var(--success)"></div>
+  </div>
+  <div class="progress-info" id="progress-info"></div>
+</div>
+
+<!-- Results -->
+<div class="results-section" id="results-section">
+
+  <!-- Metrics -->
+  <div class="card">
+    <h2>核心指标</h2>
+    <div class="metrics-grid" id="metrics-grid"></div>
+  </div>
+
+  <!-- Tabs: Chart / Signals / Positions -->
+  <div class="card">
+    <div class="tab-nav" style="display:flex;align-items:center;gap:4px;flex-wrap:wrap">
+      <button class="tab-btn active" onclick="switchTab('tab-chart',this)">权益曲线</button>
+      <button class="tab-btn" onclick="switchTab('tab-signals',this)">信号明细 (<span id="signal-count">0</span>)</button>
+      <button class="tab-btn" onclick="switchTab('tab-trades',this)">成交明细 (<span id="trade-count">0</span>)</button>
+      <button class="tab-btn" onclick="switchTab('tab-positions',this)">持仓快照</button>
+      <div style="flex:1"></div>
+      <button class="btn-small" onclick="exportCSV('signals')" title="下载信号明细 CSV" style="font-size:11px;padding:3px 10px">⬇ 信号.csv</button>
+      <button class="btn-small" onclick="exportCSV('trades')"  title="下载成交明细 CSV" style="font-size:11px;padding:3px 10px">⬇ 成交.csv</button>
+      <button class="btn-small" onclick="exportCSV('params')"  title="下载当前参数配置 CSV" style="font-size:11px;padding:3px 10px">⬇ 参数.csv</button>
+    </div>
+
+    <div class="tab-content active" id="tab-chart">
+      <div id="equity-chart"></div>
+    </div>
+
+    <div class="tab-content" id="tab-signals">
+      <input type="text" id="signal-search" placeholder="搜索 (合约/行权价/方向...)" style="margin-bottom:8px;padding:5px 10px;border:1px solid var(--border);border-radius:4px;font-size:12px;width:240px;">
+      <div class="table-wrap">
+        <table id="signals-table">
+          <thead>
+            <tr>
+              <th onclick="sortTable('signals-table',0,'num')">#</th>
+              <th onclick="sortTable('signals-table',1,'str')">时间</th>
+              <th onclick="sortTable('signals-table',2,'str')">方向</th>
+              <th onclick="sortTable('signals-table',3,'str')">标的</th>
+              <th onclick="sortTable('signals-table',4,'num')">行权价</th>
+              <th onclick="sortTable('signals-table',5,'str')">到期日</th>
+              <th onclick="sortTable('signals-table',6,'num')" title="预计单组利润 / 组数 / 预计总利润（按信号发出时盘口估算）">预计利润</th>
+              <th onclick="sortTable('signals-table',7,'num')" title="实际单组利润 / 组数 / 实际总利润（平仓后按真实成交价计算，仅平仓行有值）">实际利润</th>
+              <th onclick="sortTable('signals-table',8,'num')">Call价</th>
+              <th onclick="sortTable('signals-table',9,'num')">Put价</th>
+              <th onclick="sortTable('signals-table',10,'num')">ETF价</th>
+              <th onclick="sortTable('signals-table',11,'num')" title="盘口可承接最大组数">容量</th>
+              <th onclick="sortTable('signals-table',12,'num')" title="最大价差率（Call/Put/ETF取最大）">价差率</th>
+              <th onclick="sortTable('signals-table',13,'num')" title="多滑1 tick后剩余净利润">+1tick净利</th>
+              <th onclick="sortTable('signals-table',14,'num')" title="可承受的 tick 数（净利润容错空间）">容错ticks</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="tab-content" id="tab-trades">
+      <div class="table-wrap">
+        <table id="trades-table">
+          <thead>
+            <tr>
+              <th onclick="sortTable('trades-table',0,'num')">#</th>
+              <th onclick="sortTable('trades-table',1,'str')">时间</th>
+              <th onclick="sortTable('trades-table',2,'str')">资产类型</th>
+              <th onclick="sortTable('trades-table',3,'str')">合约代码</th>
+              <th onclick="sortTable('trades-table',4,'str')">方向</th>
+              <th onclick="sortTable('trades-table',5,'num')">成交价</th>
+              <th onclick="sortTable('trades-table',6,'num')">数量</th>
+              <th onclick="sortTable('trades-table',7,'num')">乘数</th>
+              <th onclick="sortTable('trades-table',8,'num')">手续费</th>
+              <th onclick="sortTable('trades-table',9,'num')">滑点</th>
+              <th onclick="sortTable('trades-table',10,'num')">信号ID</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="tab-content" id="tab-positions">
+      <div class="table-wrap">
+        <table id="positions-table">
+          <thead>
+            <tr>
+              <th>合约代码</th>
+              <th class="text-right">数量</th>
+              <th class="text-right">均价</th>
+              <th class="text-right">已实现盈亏</th>
+              <th class="text-right">保证金占用</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+</div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>
+<script>
+let ws = null;
+let currentTaskId = null;
+let equityChart = null;
+let isRunning = false;
+let _startTs = 0;
+let _elapsedTimer = null;
+
+// --- Init: load available dates ---
+async function loadAvailableDates() {
+  const checks = document.querySelectorAll('#ul-checks input:checked');
+  const ul = checks.length > 0 ? checks[0].value.replace('.SH','') : '510050';
+  try {
+    const resp = await fetch(`/api/backtest/dates?underlying=${ul}`);
+    const data = await resp.json();
+    const dates = data.dates || [];
+    if (dates.length > 0) {
+      document.getElementById('available-dates').textContent =
+        `可用日期: ${dates[0]} ~ ${dates[dates.length-1]} (${dates.length} 天)`;
+      if (!document.getElementById('start-date').value) {
+        document.getElementById('start-date').value = dates[0];
+        document.getElementById('end-date').value = dates[dates.length-1];
+      }
+    }
+  } catch(e) {}
+}
+loadAvailableDates();
+
+// --- WebSocket ---
+function connectWS() {
+  if (ws && ws.readyState <= 1) return;
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  ws = new WebSocket(`${proto}//${location.host}/ws/backtest`);
+  ws.onmessage = (evt) => {
+    const msg = JSON.parse(evt.data);
+    if (msg.type === 'progress') handleProgress(msg);
+    else if (msg.type === 'result') handleResult(msg.data);
+    else if (msg.type === 'error') handleError(msg.error);
+    else if (msg.type === 'cancelled') handleCancelled();
+  };
+  ws.onclose = () => { setTimeout(connectWS, 2000); };
+}
+
+function handleProgress(msg) {
+  document.getElementById('progress-section').style.display = 'block';
+
+  if (msg.stage === 'running') {
+    const done = msg.done_dates || 0;
+    const total = msg.total_dates || 1;
+    const phase = msg.day_phase || '';
+
+    // 总进度：已完成天数 + 当日 tick 进度
+    let pct = (done / total) * 100;
+    const dayPct = msg.pct_day || 0;
+    if (phase === 'loading') pct += (1 / total) * 5;
+    else if (phase === 'engine') pct += (1 / total) * (5 + dayPct * 0.9);
+    pct = Math.min(pct, 99);
+
+    document.getElementById('progress-bar').style.width = pct.toFixed(1) + '%';
+    document.getElementById('progress-bar-label').textContent =
+      `${done}/${total} 天  ${pct.toFixed(0)}%`;
+    document.getElementById('progress-text').textContent =
+      msg.message || `${msg.current_date} (${done}/${total})`;
+
+    // 当日 tick 小进度条
+    document.getElementById('progress-bar-day').style.width = dayPct.toFixed(1) + '%';
+
+    const ticks = (msg.ticks_processed || 0).toLocaleString();
+    const dayDone = (msg.day_ticks_done || 0).toLocaleString();
+    const dayTotal = (msg.day_tick_total || 0).toLocaleString();
+    document.getElementById('progress-info').textContent =
+      `累计 ${ticks} ticks | 当日 ${dayDone}/${dayTotal} (${dayPct.toFixed(0)}%)`;
+  } else if (msg.stage === 'analyzing') {
+    document.getElementById('progress-bar').style.width = '97%';
+    document.getElementById('progress-bar-label').textContent = '97%';
+    document.getElementById('progress-text').textContent = '正在分析回测结果...';
+    document.getElementById('progress-bar-day').style.width = '100%';
+  } else if (msg.stage === 'done') {
+    document.getElementById('progress-bar').style.width = '100%';
+    document.getElementById('progress-bar-label').textContent = '100%';
+    document.getElementById('progress-text').textContent = '回测完成';
+  } else {
+    document.getElementById('progress-text').textContent = msg.message || '准备中...';
+  }
+}
+
+function _startElapsedTimer() {
+  _startTs = Date.now();
+  if (_elapsedTimer) clearInterval(_elapsedTimer);
+  _elapsedTimer = setInterval(() => {
+    const s = Math.floor((Date.now() - _startTs) / 1000);
+    const m = Math.floor(s / 60), sec = s % 60;
+    document.getElementById('elapsed-badge').textContent =
+      `已运行 ${m > 0 ? m+'分' : ''}${sec}秒`;
+  }, 1000);
+}
+
+function _stopElapsedTimer() {
+  if (_elapsedTimer) { clearInterval(_elapsedTimer); _elapsedTimer = null; }
+}
+
+function handleResult(data) {
+  _stopElapsedTimer();
+  resetButton();
+  document.getElementById('progress-bar').style.width = '100%';
+  document.getElementById('progress-text').textContent = '回测完成';
+  document.getElementById('results-section').style.display = 'block';
+  window._btResult = data;  // 供 CSV 导出使用
+  renderMetrics(data.metrics);
+  renderEquityChart(data.equity_curve);
+  renderSignals(data.signals);
+  renderTrades(data.trades || []);
+  renderPositions(data.positions);
+}
+
+function handleError(err) {
+  _stopElapsedTimer();
+  resetButton();
+  const el = document.getElementById('error-msg');
+  el.textContent = '回测失败: ' + err;
+  el.style.display = 'block';
+}
+
+function handleCancelled() {
+  _stopElapsedTimer();
+  resetButton();
+  document.getElementById('progress-text').textContent = '已取消';
+  document.getElementById('progress-bar').style.width = '0%';
+}
+
+function resetButton() {
+  isRunning = false;
+  const btn = document.getElementById('btn-run');
+  btn.textContent = '启动回测';
+  btn.classList.remove('btn-danger');
+  btn.classList.add('btn-primary');
+  btn.disabled = false;
+}
+
+function setRunningButton() {
+  _startElapsedTimer();
+  isRunning = true;
+  const btn = document.getElementById('btn-run');
+  btn.textContent = '停止回测';
+  btn.classList.remove('btn-primary');
+  btn.classList.add('btn-danger');
+  btn.disabled = false;
+}
+
+// --- 收集当前表单参数 ---
+function buildParams() {
+  const checks = document.querySelectorAll('#ul-checks input:checked');
+  const underlyings = Array.from(checks).map(c => c.value);
+  return {
+    underlyings,
+    start_date: document.getElementById('start-date').value,
+    end_date: document.getElementById('end-date').value,
+    initial_capital: parseFloat(document.getElementById('initial-capital').value),
+    min_profit: parseFloat(document.getElementById('min-profit').value),
+    max_position_per_signal: parseInt(document.getElementById('max-pos').value),
+    close_profit_threshold: (v => isNaN(v) ? -100 : v)(parseFloat(document.getElementById('close-profit').value)),
+    close_before_dte: parseInt(document.getElementById('close-dte').value) || 0,
+    stop_loss_per_set: parseFloat(document.getElementById('stop-loss').value) || 0,
+    signal_mode: document.getElementById('signal-mode').value,
+    min_tolerance_ticks: parseFloat(document.getElementById('min-tolerance').value) || 0,
+    max_spread_ratio: (parseFloat(document.getElementById('max-spread-ratio').value) || 0) / 100,
+    min_max_qty: parseInt(document.getElementById('min-max-qty').value) || 0,
+    signal_cooldown_seconds: parseFloat(document.getElementById('cooldown-secs').value) || 0,
+    max_total_open_sets: parseInt(document.getElementById('max-total-sets').value) || 0,
+    min_dte_for_open: parseInt(document.getElementById('min-dte-open').value) || 0,
+    option_commission: parseFloat(document.getElementById('opt-commission').value),
+    etf_commission_rate: parseFloat(document.getElementById('etf-commission-rate').value) / 10000,
+    etf_min_commission: parseFloat(document.getElementById('etf-min-commission').value),
+    option_slippage_ticks: parseInt(document.getElementById('opt-slippage').value),
+    etf_slippage_ticks: parseInt(document.getElementById('etf-slippage').value),
+    call_margin_ratio: parseFloat(document.getElementById('call-margin').value) / 100,
+    put_margin_ratio: parseFloat(document.getElementById('put-margin').value) / 100,
+    close_next_open: document.getElementById('close-next-open').checked,
+  };
+}
+
+// --- Toggle Start / Stop ---
+async function toggleBacktest() {
+  if (isRunning && currentTaskId) {
+    // 停止
+    const btn = document.getElementById('btn-run');
+    btn.disabled = true;
+    btn.textContent = '正在停止...';
+    try {
+      await fetch(`/api/backtest/cancel/${currentTaskId}`, {method:'POST'});
+    } catch(e) {}
+    return;
+  }
+  // 启动
+  document.getElementById('error-msg').style.display = 'none';
+  document.getElementById('results-section').style.display = 'none';
+  document.getElementById('progress-section').style.display = 'block';
+  document.getElementById('progress-bar').style.width = '0%';
+  document.getElementById('progress-text').textContent = '正在启动...';
+
+  connectWS();
+
+  const body = buildParams();
+  if (body.underlyings.length === 0) {
+    handleError('请至少选择一个品种');
+    return;
+  }
+
+  try {
+    const resp = await fetch('/api/backtest/run', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify(body),
+    });
+    const data = await resp.json();
+    if (!data.ok) throw new Error(data.detail || 'unknown error');
+    currentTaskId = data.task_id;
+    // 保存本次参数到 localStorage，供"复用上次设置"使用
+    try { localStorage.setItem('dz_last_backtest_params', JSON.stringify(body)); } catch(_) {}
+    setRunningButton();
+  } catch(e) {
+    handleError(e.message);
+  }
+}
+
+// --- Render functions ---
+function renderMetrics(m) {
+  const items = [
+    { label:'总收益', val: m.total_pnl.toLocaleString()+'元', cls: m.total_pnl>=0?'positive':'negative' },
+    { label:'总收益率', val: m.total_return+'%', cls: m.total_return>=0?'positive':'negative' },
+    { label:'年化收益', val: m.annualized_return+'%', cls: m.annualized_return>=0?'positive':'negative' },
+    { label:'最大回撤', val: m.max_drawdown_pct+'%', cls:'negative' },
+    { label:'夏普比率', val: m.sharpe_ratio.toFixed(2), cls: m.sharpe_ratio>=0?'positive':'negative' },
+    { label:'胜率', val: m.win_rate+'%', cls: m.win_rate>=50?'positive':'' },
+    { label:'盈亏比', val: m.profit_loss_ratio != null ? m.profit_loss_ratio.toFixed(2) : '∞', cls: (m.profit_loss_ratio == null || m.profit_loss_ratio >= 1) ? 'positive' : '' },
+    { label:'总手续费', val: m.total_commission.toLocaleString()+'元', cls:'' },
+    { label:'总信号', val: m.total_signals, cls:'' },
+    { label:'总成交', val: m.total_trades, cls:'' },
+    { label:'交易天数', val: m.trading_days, cls:'' },
+    // 补充指标
+    { label:'实际捕获率', val: m.avg_capture_rate != null ? m.avg_capture_rate+'%' : '—',
+      cls: m.avg_capture_rate != null ? (m.avg_capture_rate>=80?'positive':m.avg_capture_rate>=50?'':'negative') : '' },
+    { label:'平均持仓', val: m.avg_holding_hours != null ? m.avg_holding_hours+'h' : '—', cls:'' },
+    { label:'强平占比', val: m.force_liq_ratio != null ? m.force_liq_ratio+'%' : '—',
+      cls: m.force_liq_ratio != null ? (m.force_liq_ratio<=10?'positive':m.force_liq_ratio>=30?'negative':'') : '' },
+    { label:'Kelly仓位', val: m.kelly_fraction != null ? m.kelly_fraction+'%' : '—',
+      cls: m.kelly_fraction != null ? (m.kelly_fraction>0?'positive':'negative') : '' },
+  ];
+  const grid = document.getElementById('metrics-grid');
+  grid.innerHTML = items.map(it =>
+    `<div class="metric-card"><div class="val ${it.cls}">${it.val}</div><div class="label">${it.label}</div></div>`
+  ).join('');
+}
+
+function renderEquityChart(curve) {
+  if (!curve || curve.length === 0) return;
+  const container = document.getElementById('equity-chart');
+  if (!equityChart) equityChart = echarts.init(container);
+  const xData = curve.map(p => p.ts.replace('T',' ').slice(0,19));
+  const yData = curve.map(p => p.equity);
+  equityChart.setOption({
+    tooltip: { trigger:'axis', formatter: p => `${p[0].axisValue}<br/>权益: ${p[0].data.toLocaleString()}` },
+    grid: { left:80, right:30, top:20, bottom:50 },
+    xAxis: { type:'category', data:xData, axisLabel:{fontSize:10, rotate:30} },
+    yAxis: { type:'value', axisLabel:{formatter:v=>(v/10000).toFixed(1)+'万'} },
+    dataZoom: [{ type:'inside' }, { type:'slider', height:20 }],
+    series: [{ type:'line', data:yData, smooth:true, lineStyle:{width:1.5}, areaStyle:{opacity:0.15}, symbol:'none' }],
+  });
+}
+
+function renderSignals(signals) {
+  document.getElementById('signal-count').textContent = signals.length;
+  const tbody = document.querySelector('#signals-table tbody');
+  tbody.innerHTML = signals.map(s => {
+    const dir = s.action === 'OPEN' ? (s.direction===1?'OPEN+':'OPEN-') : 'CLOSE';
+    const nCls = s.net_profit >= 0 ? 'positive' : 'negative';
+    const sets = s.executed_sets || null;
+    // 预计：单组利润 × 组数 = 总利润
+    const nTotal = sets != null ? (s.net_profit * sets) : null;
+    const netCell = sets != null
+      ? `<span class="${nCls}" style="font-weight:600">${s.net_profit.toFixed(2)}</span>`
+        + `<span style="color:var(--text3);font-size:11px"> ×${sets} = `
+        + `<span class="${nTotal >= 0 ? 'positive' : 'negative'}">${nTotal.toFixed(0)}</span></span>`
+      : `<span class="${nCls}">${s.net_profit.toFixed(2)}</span>`;
+    // 实际：单组利润 × 组数 = 总利润（仅 CLOSE）
+    let actualCell = '<span style="color:var(--text3)">—</span>';
+    if (s.actual_pnl != null && sets) {
+      const aPerSet = s.actual_pnl / sets;
+      const aCls = s.actual_pnl >= 0 ? 'positive' : 'negative';
+      actualCell = `<span class="${aCls}" style="font-weight:600">${aPerSet.toFixed(2)}</span>`
+        + `<span style="color:var(--text3);font-size:11px"> ×${sets} = `
+        + `<span class="${aCls}">${s.actual_pnl.toFixed(0)}</span></span>`;
+    }
+    return `<tr>
+      <td>${s.idx+1}</td>
+      <td>${(s.ts||'').replace('T',' ').slice(0,19)}</td>
+      <td>${dir}</td>
+      <td>${s.underlying}</td>
+      <td class="text-right">${s.strike}</td>
+      <td>${s.expiry}</td>
+      <td class="text-right">${netCell}</td>
+      <td class="text-right">${actualCell}</td>
+      <td class="text-right">${s.call_bid.toFixed(4)}</td>
+      <td class="text-right">${s.put_ask.toFixed(4)}</td>
+      <td class="text-right">${(s.etf_ask||0).toFixed(4)}</td>
+      <td class="text-right">${s.max_qty != null ? s.max_qty : '-'}</td>
+      <td class="text-right ${s.spread_ratio != null && s.spread_ratio > 0.02 ? 'negative' : ''}">${s.spread_ratio != null ? (s.spread_ratio*100).toFixed(2)+'%' : '-'}</td>
+      <td class="text-right ${s.net_1tick != null && s.net_1tick < 0 ? 'negative' : 'positive'}">${s.net_1tick != null ? s.net_1tick.toFixed(2) : '-'}</td>
+      <td class="text-right ${s.tolerance != null && s.tolerance < 2 ? 'negative' : s.tolerance != null && s.tolerance >= 5 ? 'positive' : ''}">${s.tolerance != null ? s.tolerance.toFixed(1) : '-'}</td>
+    </tr>`;
+  }).join('');
+
+  // Search filter
+  document.getElementById('signal-search').oninput = function() {
+    const q = this.value.toLowerCase();
+    tbody.querySelectorAll('tr').forEach(tr => {
+      tr.style.display = tr.textContent.toLowerCase().includes(q) ? '' : 'none';
+    });
+  };
+}
+
+function renderPositions(positions) {
+  const tbody = document.querySelector('#positions-table tbody');
+  if (!positions || positions.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="5" class="text-center" style="color:var(--text3)">无持仓</td></tr>';
+    return;
+  }
+  tbody.innerHTML = positions.map(p => {
+    const cls = p.realized_pnl >= 0 ? 'positive' : 'negative';
+    return `<tr>
+      <td>${p.code}</td>
+      <td class="text-right">${p.quantity}</td>
+      <td class="text-right">${p.avg_price.toFixed(4)}</td>
+      <td class="text-right ${cls}">${p.realized_pnl.toFixed(2)}</td>
+      <td class="text-right">${p.margin_occupied.toFixed(2)}</td>
+    </tr>`;
+  }).join('');
+}
+
+function renderTrades(trades) {
+  document.getElementById('trade-count').textContent = trades.length;
+  const tbody = document.querySelector('#trades-table tbody');
+  if (!trades || trades.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="11" class="text-center" style="color:var(--text3)">无成交记录</td></tr>';
+    return;
+  }
+  const dirLabel = d => d === 1 ? '<span style="color:#26c26a">买入</span>' : '<span style="color:#e05252">卖出</span>';
+  tbody.innerHTML = trades.map(t => `<tr>
+    <td>${t.trade_id}</td>
+    <td style="white-space:nowrap">${t.ts.replace('T',' ').substring(0,19)}</td>
+    <td>${t.asset_type}</td>
+    <td style="font-size:11px">${t.contract_code}</td>
+    <td>${dirLabel(t.direction)}</td>
+    <td class="text-right">${t.price.toFixed(4)}</td>
+    <td class="text-right">${t.quantity}</td>
+    <td class="text-right">${t.multiplier}</td>
+    <td class="text-right">${t.commission.toFixed(2)}</td>
+    <td class="text-right">${t.slippage_cost.toFixed(2)}</td>
+    <td class="text-right" style="color:var(--text3)">${t.signal_id ?? ''}</td>
+  </tr>`).join('');
+}
+
+function exportCSV(type) {
+  const r = window._btResult;
+  if (!r) return;
+  let rows, filename;
+
+  const splitDT = iso => { const s = iso.replace('T',' '); const i = s.indexOf(' '); return i>0 ? [s.slice(0,i), s.slice(i+1,19)] : [s, '']; };
+  if (type === 'params') {
+    const p = r.params || {};
+    const LABELS = {
+      underlyings:             '标的品种',
+      start_date:              '开始日期',
+      end_date:                '结束日期',
+      initial_capital:         '初始资金（元）',
+      min_profit:              '最小净利润（元）',
+      max_position_per_signal: '单信号最大组数',
+      min_tolerance_ticks:     '容错空间下限（ticks）',
+      max_spread_ratio:        '最大价差率上限',
+      min_max_qty:             '盘口容量下限（组）',
+      close_profit_threshold:  '平仓净利润下限（元）',
+      close_before_dte:        '临期平仓提前天数',
+      stop_loss_per_set:       '止损阈值/组（元）',
+      close_next_open:         '次日开盘强制平仓',
+      signal_cooldown_seconds: '开仓冷却时间（秒）',
+      max_total_open_sets:     '全局最大持仓组数',
+      min_dte_for_open:        '开仓最小剩余天数',
+      signal_mode:             '信号生成模式',
+      option_commission:       '期权手续费（元/张）',
+      etf_commission_rate:     'ETF 佣金率',
+      etf_min_commission:      'ETF 最低佣金（元）',
+      option_slippage_ticks:   '期权滑点（ticks）',
+      etf_slippage_ticks:      'ETF 滑点（ticks）',
+      call_margin_ratio:       '认购保证金比例',
+      put_margin_ratio:        '认沽保证金比例',
+    };
+    rows = [['参数名', '参数值']];
+    for (const [k, label] of Object.entries(LABELS)) {
+      const v = p[k] !== undefined ? p[k] : '';
+      rows.push([label, Array.isArray(v) ? v.join(';') : String(v)]);
+    }
+    // 追加回测结果摘要
+    const m = r.metrics || {};
+    rows.push(['', '']);
+    rows.push(['=== 回测结果摘要 ===', '']);
+    rows.push(['总收益（元）',     m.total_pnl ?? '']);
+    rows.push(['总收益率（%）',    m.total_return ?? '']);
+    rows.push(['年化收益率（%）',  m.annualized_return ?? '']);
+    rows.push(['最大回撤（元）',   m.max_drawdown ?? '']);
+    rows.push(['最大回撤率（%）',  m.max_drawdown_pct ?? '']);
+    rows.push(['胜率（%）',        m.win_rate ?? '']);
+    rows.push(['盈亏比',           m.profit_loss_ratio ?? '']);
+    rows.push(['Sharpe 比率',      m.sharpe_ratio ?? '']);
+    rows.push(['实际捕获率（%）',  m.avg_capture_rate ?? '']);
+    rows.push(['平均持仓（小时）', m.avg_holding_hours ?? '']);
+    rows.push(['强平占比（%）',    m.force_liq_ratio ?? '']);
+    rows.push(['Kelly 仓位（%）',  m.kelly_fraction ?? '']);
+    filename = `params_${p.start_date||'bt'}_${p.end_date||''}.csv`;
+  } else if (type === 'trades') {
+    rows = [['成交ID','日期','时间','资产类型','合约代码','买卖方向','成交价','数量','乘数','手续费','滑点','信号ID']];
+    (r.trades || []).forEach(t => {
+      const [d, tm] = splitDT(t.ts);
+      rows.push([t.trade_id, d, tm, t.asset_type, t.contract_code,
+        t.direction === 1 ? '买入' : '卖出',
+        t.price, t.quantity, t.multiplier, t.commission, t.slippage_cost,
+        t.signal_id ?? '']);
+    });
+    filename = `trades_${r.params?.start_date||'bt'}_${r.params?.end_date||''}.csv`;
+  } else {
+    rows = [['#','日期','时间','方向','标的','行权价','到期日',
+             '预计单组利润','成交组数','预计总利润',
+             '实际单组利润','实际总利润',
+             'Call价','Put价','ETF价','容量','价差率','+1tick净利','容错ticks']];
+    (r.signals || []).forEach(s => {
+      const [d, tm] = splitDT(s.ts);
+      const sets = s.executed_sets || null;
+      const nTotal = sets != null ? +(s.net_profit * sets).toFixed(2) : '';
+      const aPerSet = (s.actual_pnl != null && sets) ? +(s.actual_pnl / sets).toFixed(2) : '';
+      rows.push([s.idx, d, tm, s.action,
+        s.underlying, s.strike, s.expiry,
+        s.net_profit, sets ?? '', nTotal,
+        aPerSet, s.actual_pnl ?? '',
+        s.call_bid, s.put_ask, s.etf_ask,
+        s.max_qty ?? '', s.spread_ratio ?? '', s.net_1tick ?? '', s.tolerance ?? '']);
+    });
+    filename = `signals_${r.params?.start_date||'bt'}_${r.params?.end_date||''}.csv`;
+  }
+
+  const csv = rows.map(r => r.map(v => {
+    const s = String(v ?? '');
+    return s.includes(',') || s.includes('"') || s.includes('\n') ? `"${s.replace(/"/g,'""')}"` : s;
+  }).join(',')).join('\r\n');
+
+  const bom = '\uFEFF';  // UTF-8 BOM，让 Excel 正确识别中文
+  const blob = new Blob([bom + csv], {type: 'text/csv;charset=utf-8'});
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = filename;
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+// --- Tab switching ---
+function switchTab(tabId, btn) {
+  document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active'));
+  document.querySelectorAll('.tab-btn').forEach(el => el.classList.remove('active'));
+  document.getElementById(tabId).classList.add('active');
+  btn.classList.add('active');
+  if (tabId === 'tab-chart' && equityChart) equityChart.resize();
+}
+
+// --- Table sort ---
+let sortState = {};
+function sortTable(tableId, colIdx, type) {
+  const table = document.getElementById(tableId);
+  const tbody = table.querySelector('tbody');
+  const rows = Array.from(tbody.querySelectorAll('tr'));
+  const key = tableId + '_' + colIdx;
+  const asc = sortState[key] = !sortState[key];
+
+  rows.sort((a, b) => {
+    let va = a.cells[colIdx]?.textContent?.trim() || '';
+    let vb = b.cells[colIdx]?.textContent?.trim() || '';
+    if (type === 'num') {
+      va = parseFloat(va.replace(/[^0-9.\-]/g,'')) || 0;
+      vb = parseFloat(vb.replace(/[^0-9.\-]/g,'')) || 0;
+    }
+    if (va < vb) return asc ? -1 : 1;
+    if (va > vb) return asc ? 1 : -1;
+    return 0;
+  });
+  rows.forEach(r => tbody.appendChild(r));
+}
+
+// Handle resize
+window.addEventListener('resize', () => { if (equityChart) equityChart.resize(); });
+
+// --- 参数应用（applyParams / restoreLastParams / setAsDefault）---
+
+function applyParams(p) {
+  if (!p) return;
+  document.querySelectorAll('#ul-checks input').forEach(cb => {
+    cb.checked = Array.isArray(p.underlyings) && p.underlyings.includes(cb.value);
+  });
+  const set = (id, val) => { const el = document.getElementById(id); if (el && val !== undefined) el.value = val; };
+  set('start-date',        p.start_date);
+  set('end-date',          p.end_date);
+  set('initial-capital',   p.initial_capital);
+  set('signal-mode',       p.signal_mode);
+  set('min-profit',        p.min_profit);
+  set('max-pos',           p.max_position_per_signal);
+  set('min-tolerance',     p.min_tolerance_ticks);
+  set('max-spread-ratio',  p.max_spread_ratio != null ? +(p.max_spread_ratio * 100).toFixed(4) : undefined);
+  set('min-max-qty',       p.min_max_qty);
+  set('close-profit',      p.close_profit_threshold);
+  set('close-dte',         p.close_before_dte);
+  set('stop-loss',         p.stop_loss_per_set);
+  set('cooldown-secs',     p.signal_cooldown_seconds);
+  set('max-total-sets',    p.max_total_open_sets);
+  set('min-dte-open',      p.min_dte_for_open);
+  set('opt-commission',    p.option_commission);
+  set('etf-commission-rate', p.etf_commission_rate != null ? +(p.etf_commission_rate * 10000).toFixed(4) : undefined);
+  set('etf-min-commission', p.etf_min_commission);
+  set('opt-slippage',      p.option_slippage_ticks);
+  set('etf-slippage',      p.etf_slippage_ticks);
+  set('call-margin',       p.call_margin_ratio != null ? +(p.call_margin_ratio * 100).toFixed(1) : undefined);
+  set('put-margin',        p.put_margin_ratio  != null ? +(p.put_margin_ratio  * 100).toFixed(1) : undefined);
+  const cno = document.getElementById('close-next-open');
+  if (cno && p.close_next_open !== undefined) cno.checked = !!p.close_next_open;
+}
+
+function restoreLastParams() {
+  let p;
+  try { p = JSON.parse(localStorage.getItem('dz_last_backtest_params')); } catch(_) {}
+  applyParams(p);
+}
+
+function setAsDefault() {
+  try {
+    localStorage.setItem('dz_default_params', JSON.stringify(buildParams()));
+    const btn = document.getElementById('btn-set-default');
+    if (btn) {
+      const orig = btn.textContent;
+      btn.textContent = '✓ 已保存';
+      btn.style.borderColor = '#4ade80';
+      setTimeout(() => { btn.textContent = orig; btn.style.borderColor = '#86efac'; }, 1500);
+    }
+  } catch(_) {}
+}
+
+// 页面加载：自动应用默认参数；若有上次参数则显示复用按钮
+(function() {
+  try {
+    const def = localStorage.getItem('dz_default_params');
+    if (def) applyParams(JSON.parse(def));
+  } catch(_) {}
+  try {
+    if (localStorage.getItem('dz_last_backtest_params')) {
+      const btn = document.getElementById('btn-restore');
+      if (btn) btn.style.display = '';
+    }
+  } catch(_) {}
+})();
+</script>
+</body>
+</html>

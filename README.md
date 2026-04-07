@@ -176,11 +176,12 @@ Monitor 每行除净利润外，还展示以下辅助指标，用于判断能否
 
 ## 最近变更
 
-- **Parquet 数据质量检查脚本统一**：三旧脚本合并为 `scripts/analyze_parquet.py`，支持三品种（50/300/500ETF）ETF + 期权文件一键检查
-- **集合竞价数据落盘**：DataBus 起始时间由 9:30 提前至 9:15，完整保留集合竞价 tick
-- **信号多态架构重构**：`BaseSignal` / `SignalAction` 引入，`generate_signals` 统一入口，Engine 按 `action` 自动分派 OPEN/CLOSE
-- **PnL 防腐层 + multiplier Bug 修正**：`analysis/pnl.py` 引入多态分派，修正期权腿漏乘 `multiplier` 历史 Bug
-- **平仓闭环（Phase 6）**：回测引擎支持完整仓位生命周期（ETF T+1 冻结、保证金按比例释放、CLOSE 容量限制）
+- **回测 Web UI 上线**：`web/backtest_service.py` + `web/templates/backtest.html`，支持多品种、多日期回测，含进度推送、信号明细、权益曲线、CSV 导出
+- **回测参数新增 `min_dte_for_open`**：开仓最小剩余天数门控，防止末日轮阶段新开仓；参数从 UI → `BacktestParams` → `TradingConfig` → Engine 守卫 3 全链路贯通
+- **回测三项修复**：① Fix2 保证金基价改用前日收盘价；② Fix3 回测结束强平残余持仓；③ Fix4 min_dte_for_open 末日轮防护
+- **PnL 胜率/盈亏比 Bug 修复**：胜率统计改为仅基于已执行 CLOSE 信号（`has_trades` 过滤），CLOSE 往返净利润用 OPEN+CLOSE 合并现金流计算，消除 ETF 本金回收虚高问题
+- **盈亏比无亏损时显示 ∞**：`profit_loss_ratio` 改为 `Optional[float]`，全链路（pnl.py / backtest_service / run.py / 前端）同步处理 `None`，Kelly 仓位此时取 `win_rate × 100%`
+- **回测参数"设为默认"功能**：新增按钮将当前表单存入 `dz_default_params`，页面加载时自动静默还原
 
 ## 技术文档索引
 

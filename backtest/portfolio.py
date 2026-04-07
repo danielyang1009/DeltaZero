@@ -125,22 +125,25 @@ class Portfolio:
         contracts: Optional[Dict[str, ContractInfo]] = None,
     ) -> float:
         """
-        用当前市价更新全部持仓的浮动盈亏
+        计算全部持仓的当前市场总值（用于权益计算）
+
+        公式：equity = cash + mark_to_market(...)
+        正确做法是将持仓按当前市价折算为市场总值（而非浮动盈亏），
+        因为 cash 已在开仓时扣除了买入成本（或收入了卖出收入）。
 
         Args:
             market_prices: 合约代码 → 最新价格
             contracts:     合约信息字典（用于获取调整型合约的真实乘数）
 
         Returns:
-            当前总未实现盈亏
+            所有持仓的当前市场总值（多头为正，空头为负）
         """
-        total_unrealized = 0.0
+        total_market_value = 0.0
         for code, pos in self.positions.items():
             if pos.quantity == 0:
                 continue
-            current_price = market_prices.get(code)
-            if current_price is None:
-                continue
+            # 无市价时回退到 avg_cost（持仓市值按成本计，不影响盈亏）
+            current_price = market_prices.get(code, pos.avg_cost)
 
             if pos.asset_type == AssetType.OPTION:
                 unit = (
@@ -148,12 +151,11 @@ class Portfolio:
                     if contracts and code in contracts
                     else self.config.contract_unit
                 )
-                unrealized = (current_price - pos.avg_cost) * pos.quantity * unit
+                total_market_value += current_price * pos.quantity * unit
             else:
-                unrealized = (current_price - pos.avg_cost) * pos.quantity
+                total_market_value += current_price * pos.quantity
 
-            total_unrealized += unrealized
-        return total_unrealized
+        return total_market_value
 
     def snapshot(self, timestamp: datetime) -> AccountState:
         """生成当前账户状态全量快照"""

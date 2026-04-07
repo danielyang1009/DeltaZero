@@ -22,7 +22,7 @@ from datetime import date, datetime
 from typing import Callable, Dict, List, Optional, Tuple
 
 from config.settings import TradingConfig
-from models import ArbitrageSignal, ContractInfo, ETFTickData, OptionTickData, SignalAction
+from models import ArbitrageSignal, AssetType, ContractInfo, ETFTickData, OptionTickData, SignalAction
 from risk.margin import MarginCalculator
 
 from backtest.broker import BacktestBroker
@@ -58,6 +58,8 @@ class BacktestEngine:
         self.equity_curve: List[Tuple[datetime, float]]     = []
         self._price_cache: Dict[str, float]                 = {}
         self.contracts: Dict[str, ContractInfo]             = {}
+        self._last_open_ts: Optional[datetime]              = None  # 冷却计时
+        self._prev_close: Dict[str, float]                  = {}    # 品种前收盘价（Fix 2）
 
     # ──────────────────────────────────────────────────────────
     # 主接口（向后兼容签名）
@@ -73,6 +75,7 @@ class BacktestEngine:
             List[ArbitrageSignal],
         ],
         underlying_close: Optional[float] = None,
+        prev_close: Optional[Dict[str, float]] = None,
     ) -> Dict:
         """
         执行 Tick-by-Tick 回测
@@ -88,6 +91,7 @@ class BacktestEngine:
             {"trade_history", "signals", "equity_curve", "final_state"}
         """
         self.contracts = contracts
+        self._prev_close = prev_close or {}
         feed = HistoricalFeed(option_ticks, etf_ticks)
         logger.info("回测开始：共 %d 个 Tick 事件", len(feed))
 
@@ -113,10 +117,38 @@ class BacktestEngine:
                     if num_sets <= 0:
                         continue
                 else:
-                    # OPEN 路径：现有逻辑不变
+                    # OPEN 路径
+                    # ── 守卫 1：信号冷却（同冷却期内只开第一组）────────────
+                    if not self._check_cooldown(mtick.timestamp):
+                        logger.debug(
+                            "冷却拦截: %s 距上次开仓仅 %.3fs（冷却 %.1fs）",
+                            mtick.timestamp,
+                            (mtick.timestamp - self._last_open_ts).total_seconds(),
+                            self.config.signal_cooldown_seconds,
+                        )
+                        continue
+                    # ── 守卫 2：全局持仓上限 ────────────────────────────────
+                    if self.config.max_total_open_sets > 0:
+                        current_open = self._count_open_sets()
+                        if current_open >= self.config.max_total_open_sets:
+                            logger.debug(
+                                "持仓上限拦截: 当前 %d 组 ≥ 上限 %d 组",
+                                current_open, self.config.max_total_open_sets,
+                            )
+                            continue
+                    # ── 守卫 3：开仓最小剩余天数（末日轮防护）──────────────
+                    min_dte = getattr(self.config, "min_dte_for_open", 0)
+                    if min_dte > 0:
+                        dte = (signal.expiry - mtick.timestamp.date()).days
+                        if dte < min_dte:
+                            logger.debug(
+                                "DTE 拦截: %s 剩余 %d 天 < 最小 %d 天",
+                                signal.expiry, dte, min_dte,
+                            )
+                            continue
                     num_sets = min(
                         self.config.max_position_per_signal,
-                        self._calc_max_sets(signal, underlying_close or 0),
+                        self._calc_max_sets(signal, self._get_underlying_close(signal, underlying_close)),
                     )
                     if num_sets <= 0:
                         continue
@@ -126,18 +158,20 @@ class BacktestEngine:
                     available_cash=self.portfolio.cash,
                     margin_calculator=self.margin_calculator,
                     contracts=contracts,
-                    underlying_close=underlying_close or 0,
+                    underlying_close=self._get_underlying_close(signal, underlying_close),
                     signal_id=sig_idx,
                 )
                 if trades:
                     self.portfolio.process_trades(trades)
+                    if signal.action == SignalAction.OPEN:
+                        self._last_open_ts = mtick.timestamp  # 更新冷却计时
                 total_trades += len(trades)
 
             # 每 100 tick 采样一次权益（避免每 tick 都调 mark_to_market 拖慢速度）
             if i % 100 == 0 or i == len(merged_list) - 1:
-                market_prices = self._get_latest_prices(mtick)
-                unrealized    = self.portfolio.mark_to_market(market_prices, self.contracts)
-                equity        = self.portfolio.cash + unrealized
+                market_prices  = self._get_latest_prices(mtick)
+                positions_value = self.portfolio.mark_to_market(market_prices, self.contracts)
+                equity          = self.portfolio.cash + positions_value
                 self.equity_curve.append((mtick.timestamp, equity))
 
         logger.info(
@@ -168,10 +202,41 @@ class BacktestEngine:
     # 内部工具
     # ──────────────────────────────────────────────────────────
 
+    def _check_cooldown(self, signal_ts: datetime) -> bool:
+        """
+        冷却期检查：距上次开仓时间不足 signal_cooldown_seconds 时返回 False。
+        0 = 不限制。
+        """
+        cooldown = self.config.signal_cooldown_seconds
+        if cooldown <= 0 or self._last_open_ts is None:
+            return True
+        return (signal_ts - self._last_open_ts).total_seconds() >= cooldown
+
+    def _count_open_sets(self) -> int:
+        """
+        统计当前全局已开仓的 PCP 套利组数（按 ETF 多头仓位 ÷ unit 估算）。
+        每组 PCP 消耗 unit 股 ETF，因此 ETF 总持仓 / unit = 总开组数。
+        """
+        total = 0
+        for code, pos in self.portfolio.positions.items():
+            if pos.asset_type == AssetType.ETF and pos.quantity > 0:
+                unit = self.config.contract_unit
+                total += pos.quantity // unit
+        return total
+
+    def _get_underlying_close(self, signal: ArbitrageSignal, fallback: Optional[float]) -> float:
+        """
+        获取信号标的的保证金基价（前收盘价）。
+        优先使用 prev_close 字典（由 backtest_service 按日更新），
+        无数据时退化为传入的 fallback（当日首 tick 价格）。
+        """
+        ul = getattr(signal, "underlying", "")
+        return self._prev_close.get(ul, fallback or 0.0)
+
     def _calc_max_sets(self, signal: ArbitrageSignal, underlying_close: float) -> int:
         """根据可用资金估算最大开仓组数（粗估，精确校验在 BacktestBroker.execute_signal）"""
         unit           = signal.multiplier
-        etf_cost_est   = signal.spot_ask * unit
+        etf_cost_est   = signal.etf_ask * unit
         margin_est     = underlying_close * unit * self.config.margin.call_margin_ratio_1
         cost_per_set   = etf_cost_est + margin_est
 

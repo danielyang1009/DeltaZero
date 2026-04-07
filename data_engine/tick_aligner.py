@@ -64,19 +64,25 @@ class TickAligner:
         """
         if isinstance(tick, ETFTickData):
             self._etf_lkv[tick.etf_code] = tick
+            ts = tick.timestamp
         else:
             self._options_lkv[tick.contract_code] = tick
-        return self.snapshot()
+            ts = tick.timestamp
+        return self.snapshot(ts)
 
-    def snapshot(self) -> MarketSnapshot:
+    def snapshot(self, ts: Optional[datetime] = None) -> MarketSnapshot:
         """
         返回当前市场截面快照（浅拷贝）。
+
+        Args:
+            ts: 快照时间戳；实盘模式传 None 使用 datetime.now()，
+                回测模式传入 tick.timestamp 保留历史时间。
 
         快照的 options / etf 字典在返回时复制一次，
         避免调用方在遍历期间被并发更新覆盖。
         """
         return MarketSnapshot(
-            ts=datetime.now(),
+            ts=ts if ts is not None else datetime.now(),
             options=dict(self._options_lkv),
             etf=dict(self._etf_lkv),
         )

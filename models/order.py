@@ -89,9 +89,14 @@ class ArbitrageSignal(BaseSignal):
     net_profit: float                       # 扣费后净利润（元/组）
 
     # 执行价格（信号触发时刻的盘口价格，自包含，无需再查 snapshot）
-    call_bid: float = 0.0                   # Call 买一价（卖出 Call 对齐 bid1）
-    put_ask: float  = 0.0                   # Put 卖一价（买入 Put 对齐 ask1）
-    spot_ask: float = 0.0                   # ETF 卖一价（买入 ETF 对齐 ask1）
+    # OPEN 信号用：etf_ask / put_ask / call_bid
+    # CLOSE 信号用：etf_bid / put_bid / call_ask
+    call_bid: float = 0.0                   # Call 买一价（OPEN：卖出 Call 对齐 bid1）
+    call_ask: float = 0.0                   # Call 卖一价（CLOSE：买回 Call 对齐 ask1）
+    put_ask: float  = 0.0                   # Put 卖一价（OPEN：买入 Put 对齐 ask1）
+    put_bid: float  = 0.0                   # Put 买一价（CLOSE：卖出 Put 对齐 bid1）
+    etf_ask: float  = 0.0                   # ETF 卖一价（OPEN：买入 ETF 对齐 ask1）
+    etf_bid: float  = 0.0                   # ETF 买一价（CLOSE：卖出 ETF 对齐 bid1）
 
     # 风险与质量指标（ETF 量未知时为 None）
     max_qty: Optional[float]    = None      # 理论最大可成交组数（受盘口量约束）

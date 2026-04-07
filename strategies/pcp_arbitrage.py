@@ -388,10 +388,13 @@ class PCPArbitrageStrategy(BaseStrategy):
             strike=K,
             direction=1,
             net_profit=fwd_profit,
-            # 执行价格（供 Portfolio 和展示层直接使用）
+            # OPEN 执行价格
             call_bid=C_bid,
+            call_ask=C_ask,
             put_ask=P_ask,
-            spot_ask=S_ask,
+            put_bid=P_bid,
+            etf_ask=S_ask,
+            etf_bid=etf_tick.bid_price if not math.isnan(etf_tick.bid_price) and etf_tick.bid_price > 0 else S_ask,
             # 流动性指标
             max_qty=metrics["max_qty"],
             spread_ratio=metrics["spread_ratio"],
@@ -481,10 +484,14 @@ class PCPArbitrageStrategy(BaseStrategy):
             direction=-1,
             action=SignalAction.CLOSE,
             net_profit=close_net,
-            # 字段复用：CLOSE 语义下存平仓盘口价
-            spot_ask=S_bid,   # 实为 ETF 买一（卖出用）
-            put_ask=P_bid,    # 实为 Put 买一（卖出用）
-            call_bid=C_ask,   # 实为 Call 卖一（买入用）
+            # CLOSE 执行价格（语义明确，无字段复用）
+            etf_bid=S_bid,    # ETF 买一价（卖出 ETF）
+            put_bid=P_bid,    # Put 买一价（卖出 Put）
+            call_ask=C_ask,   # Call 卖一价（买回 Call）
+            # OPEN 字段也填上，避免展示层访问 nan
+            etf_ask=S_bid,
+            put_ask=P_bid,
+            call_bid=C_ask,
             max_qty=metrics["max_qty"],   # 盘口流动性上限（由 Broker 裁剪）
             # 元信息
             calc_detail=calc_detail,

@@ -627,7 +627,7 @@ def _monitor_compute_loop() -> None:
                 #   sig.obi_put        (旧: sig.obi_p)
                 #   sig.call_bid       (新增，直接可用)
                 #   sig.put_ask        (新增，直接可用)
-                #   sig.spot_ask       (新增，直接可用)
+                #   sig.etf_ask        (新增，直接可用)
                 ul_groups: Dict[str, list] = {}
                 for sig in signals:
                     ul_groups.setdefault(sig.underlying, []).append(sig)
@@ -664,7 +664,7 @@ def _monitor_compute_loop() -> None:
                             "obi_p":       round(sig.obi_put, 3)       if sig.obi_put     is not None else None,  # ← obi_put
                             "call_bid":    sig.call_bid,
                             "put_ask":     sig.put_ask,
-                            "spot_ask":    sig.spot_ask,                         # ← spot_ask
+                            "etf_ask":     sig.etf_ask,
                         })
                     underlyings_data[ul] = {
                         "name": ETF_CODE_TO_NAME.get(ul, ul),

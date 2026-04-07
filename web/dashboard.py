@@ -6,12 +6,16 @@ from __future__ import annotations
 
 import asyncio
 import json as _json
+import logging
 import os
 import subprocess
+import uuid
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Dict, Optional
 import time
+
+logger = logging.getLogger(__name__)
 
 import psutil
 import scipy.optimize  # noqa: F401 — 预加载 Intel MKL/libifcoremd，避免首次访问 vol_smile 时才触发
@@ -49,26 +53,31 @@ TEMPLATE_PATH = Path(__file__).resolve().parent / "templates" / "index.html"
 DDE_TEMPLATE_PATH = Path(__file__).resolve().parent / "templates" / "dde.html"
 VOL_SMILE_TEMPLATE_PATH = Path(__file__).resolve().parent / "templates" / "vol_smile.html"
 MONITOR_TEMPLATE_PATH = Path(__file__).resolve().parent / "templates" / "monitor.html"
+BACKTEST_TEMPLATE_PATH = Path(__file__).resolve().parent / "templates" / "backtest.html"
 
 app = FastAPI(title="DeltaZero Web Console", version="0.3.0")
 app.mount("/static", StaticFiles(directory=Path(__file__).resolve().parent / "static"), name="static")
 
 _ws_clients: set = set()
 _monitor_ws_clients: set = set()
+_backtest_ws_clients: set = set()
 _update_queue: Optional[asyncio.Queue] = None
 _monitor_queue: Optional[asyncio.Queue] = None
+_backtest_queue: Optional[asyncio.Queue] = None
 _event_loop: Optional[asyncio.AbstractEventLoop] = None
 
 
 @app.on_event("startup")
 async def _startup() -> None:
-    global _update_queue, _monitor_queue, _event_loop
+    global _update_queue, _monitor_queue, _backtest_queue, _event_loop
     _event_loop = asyncio.get_running_loop()
     _update_queue = asyncio.Queue(maxsize=2)
     _monitor_queue = asyncio.Queue(maxsize=5)
+    _backtest_queue = asyncio.Queue(maxsize=20)
     start_market_cache(event_loop=_event_loop, update_queue=_update_queue, monitor_queue=_monitor_queue)
     asyncio.create_task(_ws_broadcaster())
     asyncio.create_task(_monitor_broadcaster())
+    asyncio.create_task(_backtest_broadcaster())
 
 
 @app.on_event("shutdown")
@@ -113,6 +122,32 @@ async def _monitor_broadcaster() -> None:
             except Exception:
                 dead.add(ws)
         _monitor_ws_clients.difference_update(dead)
+
+
+async def _backtest_broadcaster() -> None:
+    """从 asyncio.Queue 接收回测进度/结果，广播给所有 /ws/backtest 客户端。"""
+    while True:
+        try:
+            msg = await asyncio.wait_for(_backtest_queue.get(), timeout=1.0)
+        except asyncio.TimeoutError:
+            continue
+        if not _backtest_ws_clients:
+            continue
+        dead: set = set()
+        for ws in list(_backtest_ws_clients):
+            try:
+                await ws.send_text(msg)
+            except Exception:
+                dead.add(ws)
+        _backtest_ws_clients.difference_update(dead)
+
+
+def _try_put_backtest(queue: asyncio.Queue, msg: str) -> None:
+    """线程安全地向 backtest queue 写入，队列满时丢弃（不阻塞）。"""
+    try:
+        queue.put_nowait(msg)
+    except asyncio.QueueFull:
+        pass
 
 
 @app.websocket("/ws/monitor")
@@ -1003,6 +1038,179 @@ def vol_smile(underlying: str = "510050.SH", expiry: str = "", adjusted: bool = 
         "calls": calls,
         "puts": puts,
     }
+
+
+# ============================================================
+# 回测 API
+# ============================================================
+
+class BacktestRunRequest(BaseModel):
+    underlyings: list = Field(default=["510050.SH"])
+    start_date: str = Field(default="20260323")
+    end_date: str = Field(default="20260401")
+    initial_capital: float = Field(default=1_000_000)
+    min_profit: float = Field(default=50)
+    max_position_per_signal: int = Field(default=10)
+    close_profit_threshold: float = Field(default=0.0)
+    close_before_dte: int = Field(default=0)
+    stop_loss_per_set: float = Field(default=0.0)
+    signal_mode: str = Field(default="every_tick")
+    # 开仓质量过滤
+    min_tolerance_ticks: float = Field(default=0.0)
+    max_spread_ratio: float = Field(default=0.0)
+    min_max_qty: int = Field(default=0)
+    # 信号雪崩防护
+    signal_cooldown_seconds: float = Field(default=1.0)
+    max_total_open_sets: int = Field(default=0)
+    min_dte_for_open: int = Field(default=0)
+    # 交易成本设定
+    option_commission: float = Field(default=1.7)
+    etf_commission_rate: float = Field(default=0.00006)
+    etf_min_commission: float = Field(default=0.1)
+    option_slippage_ticks: int = Field(default=1)
+    etf_slippage_ticks: int = Field(default=1)
+    call_margin_ratio: float = Field(default=0.12)
+    put_margin_ratio: float = Field(default=0.12)
+    # 次日开盘强制平仓
+    close_next_open: bool = Field(default=False)
+
+
+@app.get("/backtest", response_class=HTMLResponse)
+def backtest_page() -> str:
+    return BACKTEST_TEMPLATE_PATH.read_text(encoding="utf-8")
+
+
+@app.post("/api/backtest/run")
+async def backtest_run(req: BacktestRunRequest) -> Dict[str, Any]:
+    """启动回测任务（后台线程执行），返回 task_id。"""
+    from web.backtest_service import BacktestService, BacktestParams, BacktestTask, _tasks
+
+    task_id = str(uuid.uuid4())[:8]
+    task = BacktestTask(task_id=task_id)
+    _tasks[task_id] = task
+
+    params = BacktestParams(
+        underlyings=req.underlyings,
+        start_date=req.start_date,
+        end_date=req.end_date,
+        initial_capital=req.initial_capital,
+        min_profit=req.min_profit,
+        max_position_per_signal=req.max_position_per_signal,
+        market_data_dir=DEFAULT_MARKET_DATA_DIR,
+        close_profit_threshold=req.close_profit_threshold,
+        close_before_dte=req.close_before_dte,
+        stop_loss_per_set=req.stop_loss_per_set,
+        signal_mode=req.signal_mode,
+        min_tolerance_ticks=req.min_tolerance_ticks,
+        max_spread_ratio=req.max_spread_ratio,
+        min_max_qty=req.min_max_qty,
+        signal_cooldown_seconds=req.signal_cooldown_seconds,
+        max_total_open_sets=req.max_total_open_sets,
+        option_commission=req.option_commission,
+        etf_commission_rate=req.etf_commission_rate,
+        etf_min_commission=req.etf_min_commission,
+        option_slippage_ticks=req.option_slippage_ticks,
+        etf_slippage_ticks=req.etf_slippage_ticks,
+        call_margin_ratio=req.call_margin_ratio,
+        put_margin_ratio=req.put_margin_ratio,
+        close_next_open=req.close_next_open,
+    )
+
+    loop = asyncio.get_running_loop()
+    queue = _backtest_queue
+
+    def _push(msg_dict: Dict[str, Any]) -> None:
+        """线程安全地将消息推送到 backtest queue。"""
+        payload = _json.dumps(msg_dict)
+        loop.call_soon_threadsafe(_try_put_backtest, queue, payload)
+
+    def _progress_cb(msg: Dict[str, Any]) -> None:
+        task.progress = msg
+        _push({"type": "progress", "task_id": task_id, **msg})
+
+    def _run_in_thread() -> None:
+        try:
+            task.status = "running"
+            service = BacktestService()
+            result = service.run(params, progress_callback=_progress_cb, task=task)
+            task.result = result
+            task.status = "done"
+            _push({"type": "result", "task_id": task_id, "data": result})
+        except Exception as e:
+            import traceback
+            from web.backtest_service import _BacktestCancelled
+            if isinstance(e, _BacktestCancelled):
+                task.status = "cancelled"
+                _push({"type": "cancelled", "task_id": task_id})
+            else:
+                task.error = str(e)
+                task.status = "error"
+                logger.error("回测任务 %s 失败: %s", task_id, traceback.format_exc())
+                _push({"type": "error", "task_id": task_id, "error": str(e)})
+
+    asyncio.get_running_loop().run_in_executor(None, _run_in_thread)
+    return {"ok": True, "task_id": task_id}
+
+
+@app.get("/api/backtest/status/{task_id}")
+def backtest_status(task_id: str) -> Dict[str, Any]:
+    """查询回测任务状态（HTTP 兜底轮询）。"""
+    from web.backtest_service import get_task
+    task = get_task(task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    resp: Dict[str, Any] = {
+        "task_id": task.task_id,
+        "status": task.status,
+        "progress": task.progress,
+    }
+    if task.status == "done":
+        resp["result"] = task.result
+    if task.status == "error":
+        resp["error"] = task.error
+    return resp
+
+
+@app.post("/api/backtest/cancel/{task_id}")
+def backtest_cancel(task_id: str) -> Dict[str, Any]:
+    """请求取消回测任务（会在下一个日间切换点生效）。"""
+    from web.backtest_service import get_task
+    task = get_task(task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    if task.status not in ("pending", "running"):
+        return {"ok": False, "detail": f"任务状态为 {task.status}，无法取消"}
+    task.cancel_requested = True
+    return {"ok": True, "task_id": task_id}
+
+
+@app.get("/api/backtest/dates")
+def backtest_available_dates(underlying: str = "510050") -> Dict[str, Any]:
+    """扫描指定品种目录下可用的 Parquet 日期。"""
+    import re
+    ul_dir = Path(DEFAULT_MARKET_DATA_DIR) / underlying.replace(".SH", "")
+    if not ul_dir.is_dir():
+        return {"ok": True, "dates": []}
+    _date_re = re.compile(r"options_(\d{8})\.parquet")
+    dates = []
+    for f in sorted(ul_dir.glob("options_*.parquet")):
+        m = _date_re.search(f.name)
+        if m:
+            dates.append(m.group(1))
+    return {"ok": True, "dates": dates}
+
+
+@app.websocket("/ws/backtest")
+async def ws_backtest(ws: WebSocket) -> None:
+    await ws.accept()
+    _backtest_ws_clients.add(ws)
+    try:
+        while True:
+            await ws.receive_text()
+    except (WebSocketDisconnect, Exception):
+        pass
+    finally:
+        _backtest_ws_clients.discard(ws)
 
 
 def main() -> None:

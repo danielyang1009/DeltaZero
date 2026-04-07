@@ -234,16 +234,95 @@ def run_backtest(
             )
 
 
+def run_backtest_parquet(
+    config: TradingConfig,
+    market_data_dir: str = r"D:\MARKET_DATA",
+    underlyings: Optional[List[str]] = None,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    output_chart: Optional[str] = None,
+) -> None:
+    """
+    Parquet 数据回测入口（DataBus 落盘格式）。
+
+    通过 BacktestService 执行，与 Web UI 共用核心逻辑。
+    """
+    from web.backtest_service import BacktestService, BacktestParams
+
+    if underlyings is None:
+        from config.settings import UNDERLYINGS
+        underlyings = list(UNDERLYINGS)
+
+    params = BacktestParams(
+        underlyings=underlyings,
+        start_date=start_date or "20260101",
+        end_date=end_date or "20261231",
+        initial_capital=config.initial_capital,
+        min_profit=config.min_profit_threshold,
+        max_position_per_signal=config.max_position_per_signal,
+        market_data_dir=market_data_dir,
+    )
+
+    def _cli_progress(msg):
+        stage = msg.get("stage", "")
+        if stage == "running":
+            logger.info(
+                "回测中: %s (%d/%d) | %d ticks",
+                msg.get("current_date"), msg.get("done_dates", 0),
+                msg.get("total_dates", 0), msg.get("ticks_processed", 0),
+            )
+        elif stage == "done":
+            logger.info("回测完成")
+        elif "message" in msg:
+            logger.info(msg["message"])
+
+    service = BacktestService()
+    result = service.run(params, progress_callback=_cli_progress)
+
+    # 打印核心指标
+    m = result["metrics"]
+    print("\n" + "=" * 60)
+    print("DeltaZero PCP 套利回测结果")
+    print("=" * 60)
+    print(f"  品种:     {', '.join(underlyings)}")
+    print(f"  日期范围: {start_date} ~ {end_date}")
+    print(f"  交易天数: {m['trading_days']}")
+    print(f"  总收益:   {m['total_pnl']:,.2f} 元")
+    print(f"  总收益率: {m['total_return']:.2f}%")
+    print(f"  年化收益: {m['annualized_return']:.2f}%")
+    print(f"  最大回撤: {m['max_drawdown_pct']:.2f}%")
+    print(f"  夏普比率: {m['sharpe_ratio']:.2f}")
+    print(f"  胜率:     {m['win_rate']:.1f}%")
+    plr = m['profit_loss_ratio']
+    print(f"  盈亏比:   {plr:.2f}" if plr is not None else "  盈亏比:   ∞（无亏损）")
+    print(f"  总信号:   {m['total_signals']}")
+    print(f"  总成交:   {m['total_trades']}")
+    print(f"  总手续费: {m['total_commission']:,.2f} 元")
+    print("=" * 60)
+
+    if result["signals"]:
+        print(f"\n--- 套利信号摘要（前10条，共 {len(result['signals'])} 条） ---")
+        for sig in result["signals"][:10]:
+            action = sig["action"]
+            print(
+                f"  [{sig['idx']+1}] {sig['ts'][:19]} | {action} | "
+                f"K={sig['strike']:.4f} | 净利润={sig['net_profit']:.2f}元"
+            )
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="DeltaZero 回测入口（python -m backtest）")
-    parser.add_argument("--data-dir", default="sample_data", help="期权 Tick 数据目录")
+    parser.add_argument("--data-dir", default="sample_data", help="期权 Tick CSV 数据目录（旧模式）")
+    parser.add_argument("--market-data-dir", default=None, help="Parquet 根目录（默认 D:\\MARKET_DATA）")
+    parser.add_argument("--underlyings", nargs="+", default=None, help="回测品种（如 510050.SH 510300.SH）")
     parser.add_argument("--capital", type=float, default=1_000_000, help="初始资金")
     parser.add_argument("--min-profit", type=float, default=50, help="最小利润阈值（元/组）")
-    parser.add_argument("--start-date", default=None, metavar="YYYY-MM", help="回测起始月份（含）")
-    parser.add_argument("--end-date", default=None, metavar="YYYY-MM", help="回测结束月份（含）")
+    parser.add_argument("--max-position", type=int, default=10, help="单信号最大组数")
+    parser.add_argument("--start-date", default=None, help="回测起始日期（YYYYMMDD 或 YYYY-MM）")
+    parser.add_argument("--end-date", default=None, help="回测结束日期（YYYYMMDD 或 YYYY-MM）")
     parser.add_argument("--output-chart", default=None, help="权益曲线图输出路径")
-    parser.add_argument("--etf-data-dir", default=None, help="ETF K 线目录（CSV/Parquet）")
-    parser.add_argument("--bar-mode", choices=["close", "ohlc"], default="close", help="K 线展开模式")
+    parser.add_argument("--etf-data-dir", default=None, help="ETF K 线目录（CSV 旧模式）")
+    parser.add_argument("--bar-mode", choices=["close", "ohlc"], default="close", help="K 线展开模式（旧模式）")
     parser.add_argument("--verbose", action="store_true", help="输出详细日志")
     return parser.parse_args()
 
@@ -256,21 +335,34 @@ def main() -> None:
     config = get_default_config()
     config.initial_capital = args.capital
     config.min_profit_threshold = args.min_profit
+    config.max_position_per_signal = args.max_position
 
-    logger.info("运行模式: backtest")
-    logger.info("初始资金: {:,.0f} 元".format(config.initial_capital))
-    if args.start_date or args.end_date:
-        logger.info("回测日期范围: %s ~ %s", args.start_date or "最早", args.end_date or "最新")
-
-    run_backtest(
-        config=config,
-        data_dir=args.data_dir,
-        start_month=args.start_date,
-        end_month=args.end_date,
-        output_chart=args.output_chart,
-        etf_data_dir=args.etf_data_dir,
-        bar_mode=args.bar_mode,
-    )
+    # 判断模式：如果指定了 --market-data-dir 则走 Parquet 模式
+    if args.market_data_dir:
+        logger.info("运行模式: Parquet 回测")
+        logger.info("初始资金: {:,.0f} 元".format(config.initial_capital))
+        run_backtest_parquet(
+            config=config,
+            market_data_dir=args.market_data_dir,
+            underlyings=args.underlyings,
+            start_date=args.start_date,
+            end_date=args.end_date,
+            output_chart=args.output_chart,
+        )
+    else:
+        logger.info("运行模式: CSV 回测（旧模式）")
+        logger.info("初始资金: {:,.0f} 元".format(config.initial_capital))
+        if args.start_date or args.end_date:
+            logger.info("回测日期范围: %s ~ %s", args.start_date or "最早", args.end_date or "最新")
+        run_backtest(
+            config=config,
+            data_dir=args.data_dir,
+            start_month=args.start_date,
+            end_month=args.end_date,
+            output_chart=args.output_chart,
+            etf_data_dir=args.etf_data_dir,
+            bar_mode=args.bar_mode,
+        )
 
 
 if __name__ == "__main__":

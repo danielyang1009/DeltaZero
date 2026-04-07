@@ -90,7 +90,7 @@ class BacktestBroker(BaseBroker):
         # ── 规则 1 & 2：哨兵拦截 + 跨价撮合定价 ──────────────────
         put_exec  = signal.put_ask
         call_exec = signal.call_bid
-        etf_exec  = signal.spot_ask
+        etf_exec  = signal.etf_ask
 
         if put_exec >= _SENTINEL_ASK or put_exec <= 0:
             logger.warning(
@@ -224,18 +224,18 @@ class BacktestBroker(BaseBroker):
         """
         执行平仓信号（FOK 语义）
 
-        字段复用约定（CLOSE 语义）：
-          signal.spot_ask → ETF 买一价（卖出 ETF）
-          signal.put_ask  → Put 买一价（卖出 Put）
-          signal.call_bid → Call 卖一价（买入 Call）
+        CLOSE 字段语义：
+          signal.etf_bid  → ETF 买一价（卖出 ETF）
+          signal.put_bid  → Put 买一价（卖出 Put）
+          signal.call_ask → Call 卖一价（买入 Call）
         """
         slp  = self.config.slippage
         fee  = self.config.fee
         unit = signal.multiplier
 
-        etf_exec  = signal.spot_ask   # ETF bid
-        put_exec  = signal.put_ask    # Put bid
-        call_exec = signal.call_bid   # Call ask
+        etf_exec  = signal.etf_bid    # ETF 买一价（卖出 ETF）
+        put_exec  = signal.put_bid    # Put 买一价（卖出 Put）
+        call_exec = signal.call_ask   # Call 卖一价（买回 Call）
 
         # ── 哨兵拦截 ────────────────────────────────────────────────
         if etf_exec <= 0 or etf_exec >= _SENTINEL_ASK:

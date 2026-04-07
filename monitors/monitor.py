@@ -166,7 +166,7 @@ def _build_etf_table(
             f"{sig.obi_spot:.2f}" if sig.obi_spot is not None else "--",
             f"{sig.call_bid:.4f}",
             f"{sig.put_ask:.4f}",
-            f"{sig.spot_ask:.4f}",
+            f"{sig.etf_ask:.4f}",
         )
 
     if not display_pairs_u:

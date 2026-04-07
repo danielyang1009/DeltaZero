@@ -337,7 +337,7 @@ def signal_to_dict(sig: ArbitrageSignal) -> dict:
         "is_forward": sig.direction == 1,
         "call_bid": sig.call_bid,
         "put_ask": sig.put_ask,
-        "spot": sig.spot_ask,
+        "spot": sig.etf_ask,
         "profit": round(sig.net_profit, 0),
         "underlying": sig.underlying,
         "call_code": sig.call_code,
