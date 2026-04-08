@@ -15,7 +15,7 @@ import time
 import webbrowser
 
 from web.dashboard import main as dashboard_main
-from web.process_manager import find_monitor_processes, find_recorder_processes, spawn_module
+from web.process_manager import find_recorder_processes, spawn_module
 
 
 def _open_default_browser(path: str = "/") -> None:
@@ -31,16 +31,6 @@ def _parse_args() -> argparse.Namespace:
         choices=["none", "dde"],
         default="none",
         help="可选：启动 DataBus（none/wind/dde，默认 none）",
-    )
-    parser.add_argument(
-        "--start-monitor-zmq",
-        action="store_true",
-        help="可选：启动 Monitor（source=zmq）",
-    )
-    parser.add_argument(
-        "--start-dde-pipeline",
-        action="store_true",
-        help="一键启动 DDE 链路（等价于 --bus-source dde --start-monitor-zmq）",
     )
     parser.add_argument("--zmq-port", type=int, default=5555, help="ZMQ 端口（默认 5555）")
     parser.add_argument(
@@ -59,26 +49,12 @@ def _parse_args() -> argparse.Namespace:
 
 
 def _bootstrap_processes(args: argparse.Namespace) -> None:
-    if args.start_dde_pipeline:
-        args.bus_source = "dde"
-        args.start_monitor_zmq = True
-
     if args.bus_source != "none":
         if find_recorder_processes():
             print("[console] DataBus 已在运行，跳过启动")
         else:
             started = spawn_module("data_bus.bus", ["--source", args.bus_source, "--port", str(args.zmq_port)])
             print(f"[console] 已启动 {args.bus_source.upper()} DataBus，PID={started['pid']}")
-
-    if args.start_monitor_zmq:
-        if find_monitor_processes():
-            print("[console] Monitor 已在运行，跳过启动")
-        else:
-            started = spawn_module(
-                "monitors.monitor",
-                ["--zmq-port", str(args.zmq_port), "--refresh", "3"],
-            )
-            print(f"[console] 已启动 Monitor，PID={started['pid']}")
 
 
 if __name__ == "__main__":

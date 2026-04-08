@@ -56,7 +56,8 @@ pre{background:#0f172a;color:#e2e8f0;padding:10px;border-radius:8px;max-height:1
     <div class="card-title">DDE</div>
     <div style="display:flex;gap:8px;flex-wrap:wrap">
       <button class="btn-primary" onclick="window.open('/dde','_blank')">DDE 抓取面板</button>
-      <a href="\vol_smile" target="_blank" style="text-decoration:none"><button class="btn-primary">波动率微笑</button></a>
+      <a href="/vol_smile" target="_blank" style="text-decoration:none"><button class="btn-primary">波动率微笑</button></a>
+      <a href="/monitor" target="_blank" style="text-decoration:none"><button class="btn-open">套利监控</button></a>
     </div>
     <div id="metadataFiles" style="margin-top:8px;font-size:12px;color:#64748b"></div>
   </div>
@@ -85,24 +86,6 @@ pre{background:#0f172a;color:#e2e8f0;padding:10px;border-radius:8px;max-height:1
   <pre id="mergeLog" style="display:none;margin-top:8px"></pre>
   <hr class="sep"/>
   <div id="recActions"></div>
-</div>
-
-<div class="card" style="margin-bottom:12px">
-  <div class="card-title">Monitor — 正向套利监控</div>
-  <div style="display:flex;flex-wrap:wrap;gap:10px 18px;align-items:center">
-    <span class="kv" style="margin:0"><label style="min-width:auto;margin-right:4px">利润≥</label><input id="monProfit" type="number" step="1" style="width:60px"/>元</span>
-    <span class="kv" style="margin:0"><label style="min-width:auto;margin-right:4px">到期≤</label><input id="monExpiry" type="number" style="width:55px"/>天</span>
-<span class="kv" style="margin:0"><label style="min-width:auto;margin-right:4px">ATM上下各</label><select id="monNEachSide"><option value="0">all</option><option value="3">3</option><option value="5">5</option><option value="10">10</option></select></span>
-    <span class="kv" style="margin:0"><label style="min-width:auto;margin-right:4px">ZMQ端口</label><input id="monZmq" value="5555" type="number" style="width:60px"/></span>
-  </div>
-  <div style="display:flex;flex-wrap:wrap;gap:10px 18px;align-items:center;margin-top:8px;padding-top:8px;border-top:1px solid #e5e7eb">
-    <span style="font-size:12px;color:#64748b;font-weight:600">手续费</span>
-    <span class="kv" style="margin:0"><label style="min-width:auto;margin-right:4px">ETF费率</label><input id="monEtfFee" value="0.0002" type="number" step="0.0001" min="0" max="0.01" style="width:80px"/><span style="font-size:12px;color:#64748b;margin-left:4px">（约万2）</span></span>
-    <span class="kv" style="margin:0"><label style="min-width:auto;margin-right:4px">期权单边</label><input id="monOptFee" value="1.5" type="number" step="0.1" min="0" style="width:60px"/>元/张</span>
-    <span class="kv" style="margin:0"><label style="min-width:auto;margin-right:4px">利息成本</label><select id="monInterest"><option value="0" selected>日内（不计利息）</option><option value="1">持有到期（含利息）</option></select></span>
-    <button class="btn-primary" onclick="startMonitor()">启动 Monitor</button>
-    <a href="/monitor" target="_blank" style="text-decoration:none"><button class="btn-open">打开套利监控页</button></a>
-  </div>
 </div>
 
 <div class="card" style="margin-bottom:12px">
@@ -308,18 +291,11 @@ function renderProcessTable(procs){
   }).join("");
 }
 
-let _profitDefaultSet = false;
 async function refresh(){
   try{
     const st = await api("/api/state");
     marketDataDir = st.market_data_dir || marketDataDir;
     $("sTime").innerText = st.server_time;
-    if (!_profitDefaultSet && st.default_min_profit != null) {
-      $("monProfit").value = st.default_min_profit;
-      $("monExpiry").value = st.default_expiry_days;
-$("monNEachSide").value = st.default_n_each_side;
-      _profitDefaultSet = true;
-    }
     renderMetadataFiles(st.metadata_files);
     renderBondFiles(st.bond_files);
     renderRecorder(st);
@@ -354,26 +330,8 @@ async function killAll(){
 
 async function startRecorder(source="dde"){
   try{
-    const r = await api("/api/processes/recorder/start","POST", { source, zmq_port: parseInt($("monZmq").value) || 5555 });
+    const r = await api("/api/processes/recorder/start","POST", { source, zmq_port: 5555 });
     toast(`${source.toUpperCase()} DataBus 已启动 PID `+r.started.pid);
-  } catch(e){ toast(e.message, false); }
-  setTimeout(refresh, 1500);
-}
-
-async function startMonitor(){
-  const body = {
-    min_profit: parseFloat($("monProfit").value),
-    expiry_days: parseInt($("monExpiry").value),
-n_each_side: parseInt($("monNEachSide").value) || 0,
-    zmq_port: parseInt($("monZmq").value),
-    snapshot_dir: marketDataDir,
-    etf_fee_rate: parseFloat($("monEtfFee").value) || 0.0002,
-    option_one_side_fee: parseFloat($("monOptFee").value) || 1.5,
-    include_interest: $("monInterest").value === "1"
-  };
-  try{
-    const r = await api("/api/processes/monitor/start","POST",body);
-    toast("Monitor 已启动 PID "+r.started.pid);
   } catch(e){ toast(e.message, false); }
   setTimeout(refresh, 1500);
 }

@@ -10,7 +10,6 @@ ETF 期权 PCP 套利工具，采用四层流水线结构：
   data_bus/bus.py          — ZMQ PUB（tcp://127.0.0.1:5555）+ 可选 Parquet 落盘
        ↓
 【第 3 层】消费层（ZMQ SUB）
-  monitors/monitor.py      — Rich 终端 UI 实时刷新（PCP 套利信号）
   web/market_cache.py      — CONFLATE=1 → LKV 快照 → compute 线程向量化 IV
        ↓
 【第 4 层】展示层
@@ -21,7 +20,6 @@ ETF 期权 PCP 套利工具，采用四层流水线结构：
 |----|------|------|
 | 数据采集 | `data_bus/bus.py` | 消费 DDE tick，写 Parquet 分片，ZMQ PUB 广播 |
 | 数据总线 | ZMQ PUB 5555 | 统一消息格式：`OPT_` / `ETF_` 前缀；每 30 秒刷盘，15:10 日终合并 |
-| 消费层 | `monitors/monitor.py` | ZMQ SUB → `TickAligner` + `PCPArbitrageStrategy` → Rich 终端表格 |
 | 消费层 | `web/market_cache.py` | ZMQ SUB（CONFLATE=1）→ LKV → 每 100ms Brent 法 IV → WS 推送 |
 
 ## 策略架构：Alpha / Execution 分层
@@ -39,7 +37,7 @@ ETF 期权 PCP 套利工具，采用四层流水线结构：
     (Live Market Data: DDE/ZMQ)             (Historical Data: Parquet)
                  │                                        │
                  ▼                                        ▼
-      [ monitors/monitor.py ]               [ backtest/data_feed.py ]
+      [ web/market_cache.py ]               [ backtest/data_feed.py ]
       (ZMQ Subscriber)                      (HistoricalFeed/TickLoader)
                  │                                        │
                  └───────────────┬────────────────────────┘
@@ -61,10 +59,10 @@ ETF 期权 PCP 套利工具，采用四层流水线结构：
               │                                     │
               ▼                                     ▼
 【管线 A 终点：视觉展示】                  【管线 B 终点：执行与账务】
-[ monitors/monitor.py ]                [ backtest/broker.py + engine.py ]
-[ web/market_cache.py ]                - 哨兵拦截 / 跨价撮合 / 容量限制
-- Rich UI 终端渲染                                   │
-- WebSocket 推送                                    ▼ (TradeRecord)
+[ web/market_cache.py ]                [ backtest/broker.py + engine.py ]
+- WebSocket 推送至浏览器               - 哨兵拦截 / 跨价撮合 / 容量限制
+- /monitor 套利监控页                              │
+- /vol_smile 波动率微笑                           ▼ (TradeRecord)
 (等待人类手动下单)                     [ backtest/portfolio.py ]
                                        - 资金预检 / 保证金 / 盈亏曲线
 ```
@@ -83,7 +81,7 @@ python console.py
 1. 打开无限易
 2. 在无限易中对所需合约选择导出 DDE（真实开门机制）
 3. **9:14 前**启动 DataBus（完整捕获 9:15 集合竞价数据）
-4. 启动 Monitor
+4. 浏览器访问 `/monitor` 查看套利信号
 5. 收盘后执行"合并今日分片"并关闭进程
 
 ### DDE 启动前置步骤
@@ -101,6 +99,41 @@ python console.py
 | `GET /api/dde/state` | DataBus 运行状态 + LKV 合约统计 |
 | `GET /api/dde/poll` | 完整行情快照（STALE 超时 90s） |
 
+## 回测
+
+访问 `/backtest` 或点击控制台"PCP 套利回测"按钮。
+
+```bash
+python -m backtest.run   # 命令行模式（输出 JSON 汇总）
+```
+
+### 回测参数
+
+| 参数 | 说明 |
+|------|------|
+| 品种 | 50ETF / 300ETF / 500ETF，可多选 |
+| 日期范围 | 按交易日过滤 Parquet 数据 |
+| 初始资金 | 回测起始本金 |
+| 最小利润 | 开仓触发门槛（元/组） |
+| 到期天数上限 | 仅开仓剩余天数 ≤ N 的合约 |
+| 最小剩余天数 | `min_dte_for_open`，防末日轮新开仓 |
+| ATM 上下各 N 档 | 限制扫描行权价范围 |
+| 手续费 | ETF 费率 + 期权单边费 |
+
+### 回测输出
+
+- **权益曲线**：逐日净值折线图
+- **信号明细**：每笔开/平仓记录，含成交价、手数、净利润
+- **汇总指标**：总收益、胜率、盈亏比、最大回撤、Kelly 仓位建议
+- **CSV 导出**：信号明细可导出为 CSV
+
+### 撮合机制
+
+- **FOK 语义**：开仓 / 平仓均为全成或全撤
+- **跨价撮合**：ETF 用卖一价买入，期权用对应方向挂单价
+- **容量限制**：成交量上限来自策略填入的 `max_qty`（盘口一档量）
+- **保证金**：按上交所公式预检，资金不足则拒单
+
 ## 关键命令
 
 ```bash
@@ -111,9 +144,8 @@ python -m data_engine.bond_termstructure_fetcher --kind all
 python -m data_bus.bus --source dde
 python -m data_bus.bus --source dde --no-persist   # 仅广播不落盘
 
-# 启动 Monitor
-python -m monitors.monitor
-python -m monitors.monitor --min-profit 100 --expiry-days 30
+# 回测（命令行）
+python -m backtest.run
 ```
 
 ## 模块目录
@@ -126,8 +158,8 @@ python -m monitors.monitor --min-profit 100 --expiry-days 30
 | `backtest/` | `Broker` 撮合校验；`Engine` 主循环；`Portfolio` 会计层 |
 | `calculators/` | Black-76 IV 求解（Brent 法）；三次样条利率曲线 |
 | `analysis/` | `PnLAnalyzer` 多态防腐层，信号类型分派结算 |
-| `web/` | FastAPI 控制台；ZMQ LKV；WebSocket 推送 |
-| `monitors/` | Rich 终端 UI；ZMQ SUB → PCP 套利信号实时渲染 |
+| `web/` | FastAPI 控制台；ZMQ LKV；WebSocket 推送；回测服务 |
+| `monitors/` | 共享工具（`common.py`）；ZMQ 消息解析 |
 
 ## 数据目录约定
 
@@ -140,7 +172,7 @@ python -m monitors.monitor --min-profit 100 --expiry-days 30
 
 ## 交易参数
 
-Monitor 展示的**净利润**为正向套利预估利润：
+套利净利润公式：
 
 ```
 每股利润 = K - (S_ask + P_ask - C_bid)
@@ -154,7 +186,7 @@ Monitor 展示的**净利润**为正向套利预估利润：
 
 ## Monitor 辅助指标
 
-Monitor 每行除净利润外，还展示以下辅助指标，用于判断能否实际成交：
+套利监控页（`/monitor`）每行除净利润外，还展示以下辅助指标，用于判断能否实际成交：
 
 | 列名 | 含义 | 计算方式 |
 |------|------|----------|
@@ -176,12 +208,9 @@ Monitor 每行除净利润外，还展示以下辅助指标，用于判断能否
 
 ## 最近变更
 
-- **回测 Web UI 上线**：`web/backtest_service.py` + `web/templates/backtest.html`，支持多品种、多日期回测，含进度推送、信号明细、权益曲线、CSV 导出
-- **回测参数新增 `min_dte_for_open`**：开仓最小剩余天数门控，防止末日轮阶段新开仓；参数从 UI → `BacktestParams` → `TradingConfig` → Engine 守卫 3 全链路贯通
-- **回测三项修复**：① Fix2 保证金基价改用前日收盘价；② Fix3 回测结束强平残余持仓；③ Fix4 min_dte_for_open 末日轮防护
-- **PnL 胜率/盈亏比 Bug 修复**：胜率统计改为仅基于已执行 CLOSE 信号（`has_trades` 过滤），CLOSE 往返净利润用 OPEN+CLOSE 合并现金流计算，消除 ETF 本金回收虚高问题
-- **盈亏比无亏损时显示 ∞**：`profit_loss_ratio` 改为 `Optional[float]`，全链路（pnl.py / backtest_service / run.py / 前端）同步处理 `None`，Kelly 仓位此时取 `win_rate × 100%`
-- **回测参数"设为默认"功能**：新增按钮将当前表单存入 `dz_default_params`，页面加载时自动静默还原
+- **删除终端 Rich UI Monitor**：监控入口统一为浏览器 `/monitor` 页面（WebSocket 实时推送）
+- **回测 Web UI 上线**：`/backtest` 页面支持多品种、多日期回测，含进度推送、信号明细、权益曲线、CSV 导出；新增 `min_dte_for_open` 末日轮防护参数
+- **PnL 统计修复**：胜率改为仅基于已执行 CLOSE 信号，OPEN+CLOSE 合并现金流计算往返净利润，消除 ETF 本金回收虚高问题
 
 ## 技术文档索引
 

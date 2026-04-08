@@ -455,18 +455,6 @@ def _update_dde_health_from_rows(rows: list[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
-class MonitorStartRequest(BaseModel):
-    min_profit: float = DEFAULT_MIN_PROFIT
-    expiry_days: int = DEFAULT_EXPIRY_DAYS
-    refresh: int = DEFAULT_REFRESH_SECS
-    n_each_side: int = DEFAULT_N_EACH_SIDE
-    zmq_port: int = 5555
-    snapshot_dir: str = DEFAULT_MARKET_DATA_DIR
-    etf_fee_rate: float = 0.0002
-    option_one_side_fee: float = 1.5
-    include_interest: bool = False
-
-
 class RecorderStartRequest(BaseModel):
     source: str = Field(default="dde", pattern="^dde$")
     zmq_port: int = 5555
@@ -474,10 +462,6 @@ class RecorderStartRequest(BaseModel):
 
 class DDEPipelineStartRequest(BaseModel):
     zmq_port: int = 5555
-    refresh: int = DEFAULT_REFRESH_SECS
-    min_profit: float = DEFAULT_MIN_PROFIT
-    expiry_days: int = DEFAULT_EXPIRY_DAYS
-    n_each_side: int = DEFAULT_N_EACH_SIDE
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -633,54 +617,19 @@ def start_recorder(req: RecorderStartRequest) -> Dict[str, Any]:
     return {"ok": True, "started": started}
 
 
-@app.post("/api/processes/monitor/start")
-def start_monitor(req: MonitorStartRequest) -> Dict[str, Any]:
-    args = [
-        "--min-profit", str(req.min_profit),
-        "--expiry-days", str(req.expiry_days),
-        "--refresh", str(req.refresh),
-        "--n-each-side", str(req.n_each_side),
-        "--zmq-port", str(req.zmq_port),
-        "--snapshot-dir", req.snapshot_dir,
-        "--etf-fee-rate", str(req.etf_fee_rate),
-        "--option-one-side-fee", str(req.option_one_side_fee),
-    ]
-    if req.include_interest:
-        args.append("--include-interest")
-    return {"ok": True, "started": spawn_module("monitors.monitor", args)}
-
-
 @app.post("/api/pipelines/dde/start")
 def start_dde_pipeline(req: DDEPipelineStartRequest) -> Dict[str, Any]:
-    """
-    一键启动 DDE 链路：
-    DDE DataBus (--source dde) -> Monitor
-    """
+    """一键启动 DDE DataBus。"""
     existing_rec = find_recorder_processes()
-    existing_mon = find_monitor_processes()
     if existing_rec:
         raise HTTPException(status_code=409, detail=f"DataBus 已在运行 (PID {existing_rec[0].pid})，请先关闭")
-    if existing_mon:
-        raise HTTPException(status_code=409, detail=f"Monitor 已在运行 (PID {existing_mon[0].pid})，请先关闭")
     _ensure_infinitrader_running()
 
     rec_started = spawn_module("data_bus.bus", ["--source", "dde", "--port", str(req.zmq_port)])
-    # 给 recorder 一点启动时间，避免 monitor 过早连接
-    time.sleep(0.8)
-    mon_args = [
-        "--zmq-port", str(req.zmq_port),
-        "--snapshot-dir", DEFAULT_MARKET_DATA_DIR,
-        "--min-profit", str(req.min_profit),
-        "--expiry-days", str(req.expiry_days),
-        "--refresh", str(req.refresh),
-        "--n-each-side", str(req.n_each_side),
-    ]
-    mon_started = spawn_module("monitors.monitor", mon_args)
     return {
         "ok": True,
-        "pipeline": "dde->databus->monitor",
+        "pipeline": "dde->databus",
         "recorder": rec_started,
-        "monitor": mon_started,
         "zmq_port": req.zmq_port,
     }
 
